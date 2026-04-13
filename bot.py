@@ -64,6 +64,12 @@ CHECKIN_DATA_FILE = os.path.join(os.path.dirname(__file__), "checkin_data.json")
 # File to track users who have DMs disabled (skip them instead of retrying)
 DM_BLOCKED_FILE = os.path.join(os.path.dirname(__file__), "dm_blocked.json")
 
+# File to persist the last-known stage for each user
+MEMBER_STAGES_FILE = os.path.join(os.path.dirname(__file__), "member_stages.json")
+
+# Stages where follow-up DMs stop (user has made a sale or is scaling)
+ADVANCED_STAGES = {"4. Getting sales", "5. Scaling"}
+
 # DM pacing: send in batches to avoid spam detection
 DM_DELAY_MIN = 8   # minimum seconds between DMs
 DM_DELAY_MAX = 15  # maximum seconds between DMs
@@ -171,6 +177,26 @@ def unmark_dm_blocked(user_id):
 
 def is_dm_blocked(user_id) -> bool:
     return str(user_id) in _load_dm_blocked()
+
+
+# --- Member stage tracking (persists last-known stage across weeks) ---
+def save_member_stage(user_id, stage: str):
+    data = {}
+    if os.path.exists(MEMBER_STAGES_FILE):
+        with open(MEMBER_STAGES_FILE, "r") as f:
+            data = json.load(f)
+    data[str(user_id)] = stage
+    with open(MEMBER_STAGES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def is_advanced_stage(user_id) -> bool:
+    """Return True if the user is in Stage 4 or 5 — skip DMs for them."""
+    if not os.path.exists(MEMBER_STAGES_FILE):
+        return False
+    with open(MEMBER_STAGES_FILE, "r") as f:
+        data = json.load(f)
+    return data.get(str(user_id)) in ADVANCED_STAGES
 
 
 # --- Pending check-ins persistence ---
@@ -376,6 +402,8 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
             if cu_status == 200:
                 # Record that this user checked in this week
                 record_checkin(interaction.user.id)
+                # Persist their stage so advanced-stage users skip future DMs
+                save_member_stage(interaction.user.id, self.selected_stage)
                 # Clear DM-blocked flag if they managed to check in
                 unmark_dm_blocked(interaction.user.id)
 
@@ -582,6 +610,11 @@ async def check_pending_members():
             to_remove.append(user_id)
             continue
 
+        if is_advanced_stage(int(user_id)):
+            to_remove.append(user_id)
+            print(f"[SKIP] {member.display_name} is in advanced stage — removing from sequence")
+            continue
+
         message = _NEW_MEMBER_MESSAGES.get(step, _NEW_MEMBER_MESSAGES[4])
         try:
             view = CheckInButton()
@@ -645,6 +678,8 @@ async def _send_checkin_dms(label: str, message: str):
             if not is_eligible_member(member):
                 continue
             if str(member.id) in pending:
+                continue
+            if is_advanced_stage(member.id):
                 continue
             if has_checked_in(member.id):
                 skipped += 1
