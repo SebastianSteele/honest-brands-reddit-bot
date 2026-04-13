@@ -38,6 +38,16 @@ CU_FIELD_BLOCKER = "84fe7f3d-716c-4cd2-98c6-1a088c32d104"
 CU_FIELD_WHAT_WOULD_HELP = "074c35ab-2ad6-466c-ab8e-685aea688d86"
 CU_FIELD_NEXT_STEPS = "414d79b2-d1ab-47b8-981e-428b55f7533a"
 
+# ClickUp Check-in List field IDs (populated on each task)
+CI_FIELD_BLOCKER = "84fe7f3d-716c-4cd2-98c6-1a088c32d104"
+CI_FIELD_DATE = "f60d63b8-924b-42a5-84df-8f612656fbf2"
+CI_FIELD_MEMBER = "7a6a1a07-2e70-44ad-bb93-5e807ea7035c"
+CI_FIELD_NEXT_STEPS = "414d79b2-d1ab-47b8-981e-428b55f7533a"
+CI_FIELD_STAGE = "2e00e59d-ac4a-401e-b632-b90ec44962b2"
+CI_FIELD_WEEK = "7160ff5a-8278-4d17-8c71-b9c13f04a1a6"
+CI_FIELD_WEEKS_IN_STAGE = "2710fa28-d9bd-4462-b9c6-b8e346144518"
+CI_FIELD_WHAT_WOULD_HELP = "074c35ab-2ad6-466c-ab8e-685aea688d86"
+
 # Map bot stages to ClickUp Milestone dropdown options
 STAGE_TO_MILESTONE = {
     "1. Finding a product": "1. Select a Product",
@@ -381,6 +391,16 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
             ),
             "priority": 3,
             "tags": ["check-in", interaction.user.display_name.lower()],
+            "custom_fields": [
+                {"id": CI_FIELD_MEMBER, "value": interaction.user.display_name},
+                {"id": CI_FIELD_DATE, "value": today},
+                {"id": CI_FIELD_STAGE, "value": self.selected_stage},
+                {"id": CI_FIELD_WEEKS_IN_STAGE, "value": self.weeks.value},
+                {"id": CI_FIELD_WEEK, "value": datetime.now().isocalendar()[1]},
+                {"id": CI_FIELD_BLOCKER, "value": self.blocker.value},
+                {"id": CI_FIELD_WHAT_WOULD_HELP, "value": self.help_needed.value},
+                {"id": CI_FIELD_NEXT_STEPS, "value": self.next_steps.value},
+            ],
         }
 
         # Respond to Discord immediately (must be within 3 seconds)
