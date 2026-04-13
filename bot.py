@@ -79,8 +79,11 @@ DM_BLOCKED_FILE = os.path.join(os.path.dirname(__file__), "dm_blocked.json")
 # File to persist the last-known stage for each user
 MEMBER_STAGES_FILE = os.path.join(os.path.dirname(__file__), "member_stages.json")
 
-# Stages where follow-up DMs stop (user has made a sale or is scaling)
+# Stages where follow-up DMs stop (from check-in form selection)
 ADVANCED_STAGES = {"4. Getting sales", "5. Scaling"}
+
+# ClickUp Milestone names that exclude a member from all DMs (post-launch)
+EXCLUDED_MILESTONES = {"4. First Sale", "5. Scaling", "Velocity Audit", "Refund", "Membership Paused"}
 
 # File to track which Accelerate members have been seen (so only NEW ones get the onboarding sequence)
 KNOWN_MEMBERS_FILE = os.path.join(os.path.dirname(__file__), "known_accelerate.json")
@@ -133,15 +136,23 @@ async def fetch_accelerate_usernames() -> set:
             for task in task_list:
                 program_name_val = None
                 discord_username = None
+                milestone_name = None
                 for cf in task.get("custom_fields", []):
                     if cf.get("id") == CU_FIELD_PROGRAM_NAME:
-                        # dropdown value is stored as orderindex
                         program_name_val = cf.get("value")
                     elif cf.get("id") == CU_FIELD_DISCORD_USERNAME:
                         discord_username = (cf.get("value") or "").strip()
+                    elif cf.get("id") == CU_FIELD_MILESTONE:
+                        ms_val = cf.get("value")
+                        if ms_val is not None:
+                            opts = {o["orderindex"]: o["name"] for o in cf.get("type_config", {}).get("options", [])}
+                            milestone_name = opts.get(int(ms_val))
                 if (program_name_val is not None
                         and int(program_name_val) == CU_PROGRAM_ACCELERATE_INDEX
                         and discord_username):
+                    # Skip members whose Milestone is post-launch
+                    if milestone_name and milestone_name in EXCLUDED_MILESTONES:
+                        continue
                     usernames.add(discord_username.lower())
             page += 1
 
