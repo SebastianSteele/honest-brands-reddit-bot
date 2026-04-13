@@ -76,14 +76,8 @@ CHECKIN_DATA_FILE = os.path.join(os.path.dirname(__file__), "checkin_data.json")
 # File to track users who have DMs disabled (skip them instead of retrying)
 DM_BLOCKED_FILE = os.path.join(os.path.dirname(__file__), "dm_blocked.json")
 
-# File to persist the last-known stage for each user
-MEMBER_STAGES_FILE = os.path.join(os.path.dirname(__file__), "member_stages.json")
-
 # Stages where follow-up DMs stop (from check-in form selection)
 ADVANCED_STAGES = {"4. Getting sales", "5. Scaling"}
-
-# ClickUp Milestone names that exclude a member from all DMs (post-launch)
-EXCLUDED_MILESTONES = {"4. First Sale", "5. Scaling", "Velocity Audit", "Refund", "Membership Paused"}
 
 # File to track which Accelerate members have been seen (so only NEW ones get the onboarding sequence)
 KNOWN_MEMBERS_FILE = os.path.join(os.path.dirname(__file__), "known_accelerate.json")
@@ -136,23 +130,14 @@ async def fetch_accelerate_usernames() -> set:
             for task in task_list:
                 program_name_val = None
                 discord_username = None
-                milestone_name = None
                 for cf in task.get("custom_fields", []):
                     if cf.get("id") == CU_FIELD_PROGRAM_NAME:
                         program_name_val = cf.get("value")
                     elif cf.get("id") == CU_FIELD_DISCORD_USERNAME:
                         discord_username = (cf.get("value") or "").strip()
-                    elif cf.get("id") == CU_FIELD_MILESTONE:
-                        ms_val = cf.get("value")
-                        if ms_val is not None:
-                            opts = {o["orderindex"]: o["name"] for o in cf.get("type_config", {}).get("options", [])}
-                            milestone_name = opts.get(int(ms_val))
                 if (program_name_val is not None
                         and int(program_name_val) == CU_PROGRAM_ACCELERATE_INDEX
                         and discord_username):
-                    # Skip members whose Milestone is post-launch
-                    if milestone_name and milestone_name in EXCLUDED_MILESTONES:
-                        continue
                     usernames.add(discord_username.lower())
             page += 1
 
@@ -168,6 +153,67 @@ def is_within_join_window(member: discord.Member) -> bool:
         return False
     cutoff = datetime.now(timezone.utc) - timedelta(days=MEMBER_MAX_AGE_MONTHS * 30)
     return member.joined_at >= cutoff
+
+
+# --- ClickUp-based Stage 4/5 exclusion (checks submitted check-ins) ---
+_exclusion_cache: dict = {"user_ids": set(), "last_fetched": None}
+
+
+async def fetch_excluded_user_ids() -> set:
+    """Query the ClickUp check-in list and return a set of Discord user IDs
+    whose most recent check-in has Stage 4 or 5.  Cached for 1 hour."""
+    now = datetime.now()
+    if (_exclusion_cache["last_fetched"] is not None
+            and now - _exclusion_cache["last_fetched"] < _CACHE_TTL):
+        return _exclusion_cache["user_ids"]
+
+    headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
+    excluded = set()
+    page = 0
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(
+                    f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task",
+                    params={"include_closed": "true", "page": page},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[CLICKUP] Failed to fetch check-ins: {resp.status}")
+                        return _exclusion_cache["user_ids"]
+                    data = await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"[CLICKUP] Network error fetching check-ins: {e}")
+                return _exclusion_cache["user_ids"]
+
+            task_list = data.get("tasks", [])
+            if not task_list:
+                break
+
+            for task in task_list:
+                stage = None
+                for cf in task.get("custom_fields", []):
+                    if cf.get("id") == CI_FIELD_STAGE:
+                        stage = (cf.get("value") or "").strip()
+                if stage and stage in ADVANCED_STAGES:
+                    # Extract Discord user ID from uid: tag
+                    for tag in task.get("tags", []):
+                        tag_name = tag.get("name", "")
+                        if tag_name.startswith("uid:"):
+                            excluded.add(tag_name[4:])
+            page += 1
+
+    _exclusion_cache["user_ids"] = excluded
+    _exclusion_cache["last_fetched"] = now
+    print(f"[CLICKUP] Refreshed exclusion cache: {len(excluded)} members in Stage 4/5")
+    return excluded
+
+
+def is_advanced_stage(user_id, excluded_ids: set) -> bool:
+    """Return True if the user's ID appears in the ClickUp-based exclusion set."""
+    return str(user_id) in excluded_ids
 
 # --- Discord setup ---
 intents = discord.Intents.default()
@@ -259,26 +305,6 @@ def unmark_dm_blocked(user_id):
 
 def is_dm_blocked(user_id) -> bool:
     return str(user_id) in _load_dm_blocked()
-
-
-# --- Member stage tracking (persists last-known stage across weeks) ---
-def save_member_stage(user_id, stage: str):
-    data = {}
-    if os.path.exists(MEMBER_STAGES_FILE):
-        with open(MEMBER_STAGES_FILE, "r") as f:
-            data = json.load(f)
-    data[str(user_id)] = stage
-    with open(MEMBER_STAGES_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def is_advanced_stage(user_id) -> bool:
-    """Return True if the user is in Stage 4 or 5 — skip DMs for them."""
-    if not os.path.exists(MEMBER_STAGES_FILE):
-        return False
-    with open(MEMBER_STAGES_FILE, "r") as f:
-        data = json.load(f)
-    return data.get(str(user_id)) in ADVANCED_STAGES
 
 
 # --- Pending check-ins persistence ---
@@ -461,7 +487,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                 f"**Next Steps:** {self.next_steps.value}"
             ),
             "priority": 3,
-            "tags": ["check-in", interaction.user.display_name.lower()],
+            "tags": ["check-in", f"uid:{interaction.user.id}"],
             "custom_fields": [
                 {"id": CI_FIELD_MEMBER, "value": interaction.user.display_name},
                 {"id": CI_FIELD_DATE, "value": today},
@@ -494,8 +520,6 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
             if cu_status == 200:
                 # Record that this user checked in this week
                 record_checkin(interaction.user.id)
-                # Persist their stage so advanced-stage users skip future DMs
-                save_member_stage(interaction.user.id, self.selected_stage)
                 # Clear DM-blocked flag if they managed to check in
                 unmark_dm_blocked(interaction.user.id)
 
@@ -626,6 +650,7 @@ async def trigger_checkins(interaction: discord.Interaction):
 async def checkin_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     accelerate_usernames = await fetch_accelerate_usernames()
+    excluded_ids = await fetch_excluded_user_ids()
     cutoff = datetime.now(timezone.utc) - timedelta(days=MEMBER_MAX_AGE_MONTHS * 30)
     lines = []
     for member in interaction.guild.members:
@@ -643,7 +668,7 @@ async def checkin_status(interaction: discord.Interaction):
         if has_checked_in(member.id):
             reasons.append("already checked in this week")
             eligible = False
-        if is_advanced_stage(member.id):
+        if is_advanced_stage(member.id, excluded_ids):
             reasons.append("Stage 4/5")
             eligible = False
         if is_dm_blocked(member.id):
@@ -824,6 +849,8 @@ async def check_pending_members():
     if not pending:
         return
 
+    excluded_ids = await fetch_excluded_user_ids()
+
     now = datetime.now()
     to_remove = []
 
@@ -850,7 +877,7 @@ async def check_pending_members():
             to_remove.append(user_id)
             continue
 
-        if is_advanced_stage(int(user_id)):
+        if is_advanced_stage(int(user_id), excluded_ids):
             to_remove.append(user_id)
             print(f"[SKIP] {member.display_name} is in advanced stage — removing from sequence")
             continue
@@ -904,6 +931,7 @@ async def _send_checkin_dms(label: str, message: str):
     - Cross-guild deduplication
     """
     accelerate_usernames = await fetch_accelerate_usernames()
+    excluded_ids = await fetch_excluded_user_ids()
     pending = load_pending()
     sent = 0
     skipped = 0
@@ -924,7 +952,7 @@ async def _send_checkin_dms(label: str, message: str):
                 continue
             if str(member.id) in pending:
                 continue
-            if is_advanced_stage(member.id):
+            if is_advanced_stage(member.id, excluded_ids):
                 continue
             if has_checked_in(member.id):
                 skipped += 1
