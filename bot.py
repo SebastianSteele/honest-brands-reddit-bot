@@ -46,8 +46,11 @@ STAGE_TO_MILESTONE = {
     "5. Scaling": "Scaling",
 }
 
-# Roles that trigger the 1-week delayed check-in DM
-CHECKIN_ROLES = {"accelerate", "core", "scale", "velocity"}
+# Role that triggers check-in automation
+CHECKIN_ROLES = {"accelerate"}
+
+# Only DM members who joined within this many months
+MEMBER_MAX_AGE_MONTHS = 7
 
 # File to persist pending new joiners awaiting their first check-in
 PENDING_FILE = os.path.join(os.path.dirname(__file__), "pending_checkins.json")
@@ -63,6 +66,17 @@ DM_DELAY_MIN = 8   # minimum seconds between DMs
 DM_DELAY_MAX = 15  # maximum seconds between DMs
 DM_BATCH_SIZE = 20  # pause after this many DMs
 DM_BATCH_PAUSE = 60  # seconds to pause between batches
+
+
+def is_eligible_member(member: discord.Member) -> bool:
+    """Return True if the member has the Accelerate role and joined within MEMBER_MAX_AGE_MONTHS."""
+    member_roles = {r.name.lower() for r in member.roles}
+    if not member_roles & CHECKIN_ROLES:
+        return False
+    if member.joined_at is None:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MEMBER_MAX_AGE_MONTHS * 30)
+    return member.joined_at >= cutoff
 
 # --- Discord setup ---
 intents = discord.Intents.default()
@@ -483,14 +497,14 @@ async def trigger_checkins(interaction: discord.Interaction):
         await interaction.followup.send(f"⚠️ Error: {e}", ephemeral=True)
 
 
-# --- Detect new members getting accelerate/core role ---
+# --- Detect new members getting the Accelerate role ---
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     before_roles = {r.name.lower() for r in before.roles}
     after_roles = {r.name.lower() for r in after.roles}
     new_roles = after_roles - before_roles
 
-    if new_roles & CHECKIN_ROLES:
+    if new_roles & CHECKIN_ROLES and is_eligible_member(after):
         pending = load_pending()
         user_key = str(after.id)
         if user_key not in pending:
@@ -580,9 +594,8 @@ async def _send_checkin_dms(label: str, message: str):
             if member.bot or member.id in seen_users:
                 continue
             seen_users.add(member.id)
-            # Only DM members with a check-in role
-            member_roles = {r.name.lower() for r in member.roles}
-            if not member_roles & CHECKIN_ROLES:
+            # Only DM eligible members (Accelerate role + joined within 7 months)
+            if not is_eligible_member(member):
                 continue
             if str(member.id) in pending:
                 continue
