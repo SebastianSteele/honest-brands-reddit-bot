@@ -549,6 +549,50 @@ async def trigger_checkins(interaction: discord.Interaction):
         await interaction.followup.send(f"⚠️ Error: {e}", ephemeral=True)
 
 
+# --- Admin command: show eligibility status for all Accelerate members ---
+@tree.command(name="checkin_status", description="[Admin] Show which Accelerate members are eligible for check-in DMs")
+@app_commands.default_permissions(administrator=True)
+async def checkin_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MEMBER_MAX_AGE_MONTHS * 30)
+    lines = []
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        member_roles = {r.name.lower() for r in member.roles}
+        if not member_roles & CHECKIN_ROLES:
+            continue
+        joined = member.joined_at
+        joined_str = joined.strftime("%b %d, %Y") if joined else "unknown"
+        reasons = []
+        eligible = True
+        if joined and joined < cutoff:
+            reasons.append(f"joined {joined_str} (>{MEMBER_MAX_AGE_MONTHS} months ago)")
+            eligible = False
+        if has_checked_in(member.id):
+            reasons.append("already checked in this week")
+            eligible = False
+        if is_advanced_stage(member.id):
+            reasons.append("Stage 4/5")
+            eligible = False
+        if is_dm_blocked(member.id):
+            reasons.append("DMs blocked")
+            eligible = False
+        status = "✅" if eligible else "❌"
+        reason_text = f" — {', '.join(reasons)}" if reasons else ""
+        lines.append(f"{status} **{member.display_name}** (joined {joined_str}){reason_text}")
+
+    if not lines:
+        await interaction.followup.send("No members with the Accelerate role found.", ephemeral=True)
+        return
+
+    msg = f"**Accelerate Members — Eligibility Report**\n(Filter: joined within {MEMBER_MAX_AGE_MONTHS} months)\n\n" + "\n".join(lines)
+    # Discord message limit is 2000 chars
+    if len(msg) > 1900:
+        msg = msg[:1900] + "\n... (truncated)"
+    await interaction.followup.send(msg, ephemeral=True)
+
+
 # --- Detect new members getting the Accelerate role ---
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member):
