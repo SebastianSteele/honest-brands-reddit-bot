@@ -52,6 +52,9 @@ CHECKIN_ROLES = {"accelerate"}
 # Only DM members who joined within this many months
 MEMBER_MAX_AGE_MONTHS = 7
 
+# Total weekly DMs in the new-member sequence (overridden by NEW_MEMBER_TOTAL_STEPS env var in testing)
+NEW_MEMBER_TOTAL_STEPS = int(os.getenv("NEW_MEMBER_TOTAL_STEPS", "4"))
+
 # File to persist pending new joiners awaiting their first check-in
 PENDING_FILE = os.path.join(os.path.dirname(__file__), "pending_checkins.json")
 
@@ -511,12 +514,42 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             pending[user_key] = {
                 "guild_id": after.guild.id,
                 "added_at": datetime.now().isoformat(),
+                "step": 1,
             }
             save_pending(pending)
             print(f"[PENDING] {after.display_name} added — first check-in in 7 days")
 
 
-# --- Background task: send first check-in DM after 1 week ---
+# Messages for each step of the new-member check-in sequence
+_NEW_MEMBER_MESSAGES = {
+    1: (
+        "**📋 Welcome to your first Check-in!**\n\n"
+        "You've been with us for a week now — time for your first accountability check-in.\n"
+        "Click the button below to submit your progress update.\n\n"
+        "*This helps us keep your support aligned each week.*"
+    ),
+    2: (
+        "**📋 Week 2 Check-in**\n\n"
+        "Two weeks in — great to have you here! Time to log your progress.\n"
+        "Click the button below to submit your weekly check-in.\n\n"
+        "*Your CSM uses this to tailor support for you.*"
+    ),
+    3: (
+        "**📋 Week 3 Check-in**\n\n"
+        "You're three weeks in — keep the momentum going!\n"
+        "Click the button below to submit your weekly check-in.\n\n"
+        "*Consistent check-ins = faster progress.*"
+    ),
+    4: (
+        "**📋 Week 4 Check-in**\n\n"
+        "Four weeks with us — incredible progress so far!\n"
+        "Click the button below to submit your final onboarding check-in.\n\n"
+        "*After this you'll move to the regular weekly check-in schedule.*"
+    ),
+}
+
+
+# --- Background task: send new-member check-in sequence (4 DMs, weekly) ---
 @tasks.loop(hours=6)
 async def check_pending_members():
     pending = load_pending()
@@ -526,41 +559,55 @@ async def check_pending_members():
     now = datetime.now()
     to_remove = []
 
-    for user_id, info in pending.items():
+    for user_id, info in list(pending.items()):
+        step = info.get("step", 1)
         added_at = datetime.fromisoformat(info["added_at"])
-        if now - added_at >= timedelta(days=7):
-            guild = client.get_guild(info["guild_id"])
-            if not guild:
-                to_remove.append(user_id)
-                continue
-            member = guild.get_member(int(user_id))
-            if not member:
-                to_remove.append(user_id)
-                continue
-            try:
-                view = CheckInButton()
-                await member.send(
-                    "**📋 Welcome to your first Check-in!**\n\n"
-                    "You've been with us for a week now — time for your first accountability check-in.\n"
-                    "Click the button below to submit your progress update.\n\n"
-                    "*This helps us keep your support aligned each week.*",
-                    view=view,
-                )
-                print(f"[DM] First check-in sent to {member.display_name}")
-                await asyncio.sleep(random.uniform(DM_DELAY_MIN, DM_DELAY_MAX))
-            except discord.Forbidden:
-                mark_dm_blocked(int(user_id))
-                print(f"[SKIP] Can't DM {member.display_name} (DMs disabled — marked blocked)")
-            except discord.HTTPException as e:
-                if e.status == 429:
-                    retry_after = getattr(e, "retry_after", 60)
-                    print(f"[RATE] 429 hit — backing off {retry_after}s")
-                    await asyncio.sleep(retry_after)
-                    # Don't remove from pending — retry next cycle
-                    continue
-                else:
-                    print(f"[ERROR] DM to {member.display_name}: {e}")
+        # Each step fires 7 days after the previous one (step 1 = day 7, step 2 = day 14, ...)
+        last_sent_at = (
+            datetime.fromisoformat(info["last_sent_at"])
+            if info.get("last_sent_at")
+            else added_at
+        )
+        next_send = last_sent_at + timedelta(days=7)
+
+        if now < next_send:
+            continue
+
+        guild = client.get_guild(info["guild_id"])
+        if not guild:
             to_remove.append(user_id)
+            continue
+        member = guild.get_member(int(user_id))
+        if not member:
+            to_remove.append(user_id)
+            continue
+
+        message = _NEW_MEMBER_MESSAGES.get(step, _NEW_MEMBER_MESSAGES[4])
+        try:
+            view = CheckInButton()
+            await member.send(message, view=view)
+            print(f"[DM] New-member step {step} sent to {member.display_name}")
+            await asyncio.sleep(random.uniform(DM_DELAY_MIN, DM_DELAY_MAX))
+
+            if step >= NEW_MEMBER_TOTAL_STEPS:
+                to_remove.append(user_id)
+            else:
+                pending[user_id]["step"] = step + 1
+                pending[user_id]["last_sent_at"] = now.isoformat()
+
+        except discord.Forbidden:
+            mark_dm_blocked(int(user_id))
+            to_remove.append(user_id)
+            print(f"[SKIP] Can't DM {member.display_name} (DMs disabled — marked blocked)")
+        except discord.HTTPException as e:
+            if e.status == 429:
+                retry_after = getattr(e, "retry_after", 60)
+                print(f"[RATE] 429 hit — backing off {retry_after}s")
+                await asyncio.sleep(retry_after)
+                # Don't advance step — retry next cycle
+            else:
+                print(f"[ERROR] DM to {member.display_name}: {e}")
+                to_remove.append(user_id)
 
     for uid in to_remove:
         pending.pop(uid, None)
