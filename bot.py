@@ -82,6 +82,9 @@ MEMBER_STAGES_FILE = os.path.join(os.path.dirname(__file__), "member_stages.json
 # Stages where follow-up DMs stop (user has made a sale or is scaling)
 ADVANCED_STAGES = {"4. Getting sales", "5. Scaling"}
 
+# File to track which Accelerate members have been seen (so only NEW ones get the onboarding sequence)
+KNOWN_MEMBERS_FILE = os.path.join(os.path.dirname(__file__), "known_accelerate.json")
+
 # DM pacing: send in batches to avoid spam detection
 DM_DELAY_MIN = 8   # minimum seconds between DMs
 DM_DELAY_MAX = 15  # maximum seconds between DMs
@@ -656,13 +659,26 @@ async def checkin_status(interaction: discord.Interaction):
 # --- Periodic scan: detect new Accelerate members from ClickUp ---
 @tasks.loop(hours=6)
 async def scan_new_accelerate_members():
-    """Check ClickUp for Accelerate members not yet in the pending queue."""
+    """Check ClickUp for NEW Accelerate members not yet seen by the bot.
+
+    First run: marks all existing members as 'known' WITHOUT adding them to
+    the onboarding pending queue — they get weekly broadcasts instead.
+    Subsequent runs: only truly new members are added to pending.
+    """
     accelerate_usernames = await fetch_accelerate_usernames()
     if not accelerate_usernames:
         return
 
+    # Load known members (already-seen Accelerate members)
+    known = {}
+    if os.path.exists(KNOWN_MEMBERS_FILE):
+        with open(KNOWN_MEMBERS_FILE, "r") as f:
+            known = json.load(f)
+
+    first_run = len(known) == 0
     pending = load_pending()
     added = 0
+    newly_known = 0
 
     for guild in client.guilds:
         for member in guild.members:
@@ -673,21 +689,39 @@ async def scan_new_accelerate_members():
             if not is_within_join_window(member):
                 continue
             user_key = str(member.id)
-            if user_key in pending:
+            if user_key in known:
                 continue
-            if has_checked_in(member.id):
+
+            # Mark as known
+            known[user_key] = {"username": member.name, "seen_at": datetime.now().isoformat()}
+            newly_known += 1
+
+            if first_run:
+                # First run — don't add existing members to onboarding queue
                 continue
-            pending[user_key] = {
-                "guild_id": guild.id,
-                "added_at": datetime.now().isoformat(),
-                "step": 1,
-            }
-            added += 1
-            print(f"[PENDING] {member.display_name} added via ClickUp scan — first check-in in 7 days")
+
+            # Truly new member — add to onboarding pending queue
+            if user_key not in pending and not has_checked_in(member.id):
+                pending[user_key] = {
+                    "guild_id": guild.id,
+                    "added_at": datetime.now().isoformat(),
+                    "step": 1,
+                }
+                added += 1
+                print(f"[PENDING] {member.display_name} added via ClickUp scan — first check-in in 7 days")
+
+    with open(KNOWN_MEMBERS_FILE, "w") as f:
+        json.dump(known, f, indent=2)
 
     if added:
         save_pending(pending)
-    print(f"[SCAN] Checked {len(accelerate_usernames)} Accelerate members, added {added} new")
+
+    if first_run:
+        # Clear any incorrectly added pending entries from before this fix
+        save_pending({})
+        print(f"[SCAN] First run — registered {newly_known} existing Accelerate members (no onboarding DMs)")
+    else:
+        print(f"[SCAN] Checked {len(accelerate_usernames)} Accelerate members, {newly_known} newly seen, {added} added to onboarding")
 
 
 @scan_new_accelerate_members.before_loop
