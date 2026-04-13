@@ -572,7 +572,55 @@ _NEW_MEMBER_MESSAGES = {
     4: (
         "**📋 Week 4 Check-in**\n\n"
         "Four weeks with us — incredible progress so far!\n"
-        "Click the button below to submit your final onboarding check-in.\n\n"
+        "Click the button below to submit your weekly check-in.\n\n"
+        "*Keep it up — consistency is everything.*"
+    ),
+    5: (
+        "**📋 Week 5 Check-in**\n\n"
+        "Five weeks in — you're building great habits!\n"
+        "Click the button below to submit your weekly check-in.\n\n"
+        "*Your CSM uses this to tailor support for you.*"
+    ),
+    6: (
+        "**📋 Week 6 Check-in**\n\n"
+        "Six weeks in — stay focused on your next milestone.\n"
+        "Click the button below to submit your weekly check-in.\n\n"
+        "*Consistent check-ins = faster progress.*"
+    ),
+    7: (
+        "**📋 Week 7 Check-in**\n\n"
+        "Seven weeks in — you're doing amazing!\n"
+        "Click the button below to submit your weekly progress update.\n\n"
+        "*We're here to support you every step of the way.*"
+    ),
+    8: (
+        "**📋 Week 8 Check-in**\n\n"
+        "Two months in — keep pushing toward your goals!\n"
+        "Click the button below to submit your weekly check-in.\n\n"
+        "*Your progress matters — let's track it together.*"
+    ),
+    9: (
+        "**📋 Week 9 Check-in**\n\n"
+        "Nine weeks in — every check-in brings you closer.\n"
+        "Click the button below to submit your weekly progress update.\n\n"
+        "*Consistency is the key to results.*"
+    ),
+    10: (
+        "**📋 Week 10 Check-in**\n\n"
+        "Ten weeks in — outstanding commitment!\n"
+        "Click the button below to submit your weekly check-in.\n\n"
+        "*Your CSM reviews every submission to better support you.*"
+    ),
+    11: (
+        "**📋 Week 11 Check-in**\n\n"
+        "Almost at the finish line — week 11 check-in time!\n"
+        "Click the button below to submit your progress update.\n\n"
+        "*One more week after this — keep going!*"
+    ),
+    12: (
+        "**📋 Week 12 Check-in — Final!**\n\n"
+        "You've reached week 12 — congratulations on an incredible run!\n"
+        "Click the button below to submit your final check-in.\n\n"
         "*After this you'll move to the regular weekly check-in schedule.*"
     ),
 }
