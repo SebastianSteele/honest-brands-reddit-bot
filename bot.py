@@ -38,6 +38,10 @@ CU_FIELD_BLOCKER = "84fe7f3d-716c-4cd2-98c6-1a088c32d104"
 CU_FIELD_WHAT_WOULD_HELP = "074c35ab-2ad6-466c-ab8e-685aea688d86"
 CU_FIELD_NEXT_STEPS = "414d79b2-d1ab-47b8-981e-428b55f7533a"
 
+# ClickUp Program Name field (dropdown) — used to identify Accelerate members
+CU_FIELD_PROGRAM_NAME = "d44e9584-d751-40fb-9b52-0cb7fb9d80aa"
+CU_PROGRAM_ACCELERATE_INDEX = 1  # orderindex for "Accelerate" in the dropdown
+
 # ClickUp Check-in List field IDs (populated on each task)
 CI_FIELD_BLOCKER = "84fe7f3d-716c-4cd2-98c6-1a088c32d104"
 CI_FIELD_DATE = "f60d63b8-924b-42a5-84df-8f612656fbf2"
@@ -56,9 +60,6 @@ STAGE_TO_MILESTONE = {
     "4. Getting sales": "4. First Sale",
     "5. Scaling": "Scaling",
 }
-
-# Role that triggers check-in automation
-CHECKIN_ROLES = {"accelerate"}
 
 # Only DM members who joined within this many months
 MEMBER_MAX_AGE_MONTHS = 7
@@ -88,11 +89,67 @@ DM_BATCH_SIZE = 20  # pause after this many DMs
 DM_BATCH_PAUSE = 60  # seconds to pause between batches
 
 
-def is_eligible_member(member: discord.Member) -> bool:
-    """Return True if the member has the Accelerate role and joined within MEMBER_MAX_AGE_MONTHS."""
-    member_roles = {r.name.lower() for r in member.roles}
-    if not member_roles & CHECKIN_ROLES:
-        return False
+# --- ClickUp-based Accelerate member lookup (cached) ---
+_accelerate_cache: dict = {"usernames": set(), "last_fetched": None}
+_CACHE_TTL = timedelta(hours=1)
+
+
+async def fetch_accelerate_usernames() -> set:
+    """Query ClickUp Member Database and return a set of lowercased Discord usernames
+    whose Program Name is 'Accelerate'.  Results are cached for 1 hour."""
+    now = datetime.now()
+    if (_accelerate_cache["last_fetched"] is not None
+            and now - _accelerate_cache["last_fetched"] < _CACHE_TTL):
+        return _accelerate_cache["usernames"]
+
+    headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
+    usernames = set()
+    page = 0
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(
+                    f"https://api.clickup.com/api/v2/list/{CLICKUP_MEMBER_DB_LIST_ID}/task",
+                    params={"include_closed": "true", "subtasks": "true", "page": page},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[CLICKUP] Failed to fetch members: {resp.status}")
+                        return _accelerate_cache["usernames"]  # return stale cache
+                    data = await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"[CLICKUP] Network error: {e}")
+                return _accelerate_cache["usernames"]
+
+            task_list = data.get("tasks", [])
+            if not task_list:
+                break
+
+            for task in task_list:
+                program_name_val = None
+                discord_username = None
+                for cf in task.get("custom_fields", []):
+                    if cf.get("id") == CU_FIELD_PROGRAM_NAME:
+                        # dropdown value is stored as orderindex
+                        program_name_val = cf.get("value")
+                    elif cf.get("id") == CU_FIELD_DISCORD_USERNAME:
+                        discord_username = (cf.get("value") or "").strip()
+                if (program_name_val is not None
+                        and int(program_name_val) == CU_PROGRAM_ACCELERATE_INDEX
+                        and discord_username):
+                    usernames.add(discord_username.lower())
+            page += 1
+
+    _accelerate_cache["usernames"] = usernames
+    _accelerate_cache["last_fetched"] = now
+    print(f"[CLICKUP] Refreshed Accelerate cache: {len(usernames)} members")
+    return usernames
+
+
+def is_within_join_window(member: discord.Member) -> bool:
+    """Return True if the member joined within MEMBER_MAX_AGE_MONTHS."""
     if member.joined_at is None:
         return False
     cutoff = datetime.now(timezone.utc) - timedelta(days=MEMBER_MAX_AGE_MONTHS * 30)
@@ -554,13 +611,13 @@ async def trigger_checkins(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def checkin_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
+    accelerate_usernames = await fetch_accelerate_usernames()
     cutoff = datetime.now(timezone.utc) - timedelta(days=MEMBER_MAX_AGE_MONTHS * 30)
     lines = []
     for member in interaction.guild.members:
         if member.bot:
             continue
-        member_roles = {r.name.lower() for r in member.roles}
-        if not member_roles & CHECKIN_ROLES:
+        if member.name.lower() not in accelerate_usernames:
             continue
         joined = member.joined_at
         joined_str = joined.strftime("%b %d, %Y") if joined else "unknown"
@@ -583,34 +640,59 @@ async def checkin_status(interaction: discord.Interaction):
         lines.append(f"{status} **{member.display_name}** (joined {joined_str}){reason_text}")
 
     if not lines:
-        await interaction.followup.send("No members with the Accelerate role found.", ephemeral=True)
+        await interaction.followup.send(
+            f"No Accelerate members found in Discord.\n"
+            f"ClickUp has {len(accelerate_usernames)} Accelerate usernames: {', '.join(sorted(accelerate_usernames)) or 'none'}",
+            ephemeral=True,
+        )
         return
 
-    msg = f"**Accelerate Members — Eligibility Report**\n(Filter: joined within {MEMBER_MAX_AGE_MONTHS} months)\n\n" + "\n".join(lines)
-    # Discord message limit is 2000 chars
+    msg = f"**Accelerate Members — Eligibility Report**\n(Source: ClickUp Program Name | Filter: joined within {MEMBER_MAX_AGE_MONTHS} months)\n\n" + "\n".join(lines)
     if len(msg) > 1900:
         msg = msg[:1900] + "\n... (truncated)"
     await interaction.followup.send(msg, ephemeral=True)
 
 
-# --- Detect new members getting the Accelerate role ---
-@client.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    before_roles = {r.name.lower() for r in before.roles}
-    after_roles = {r.name.lower() for r in after.roles}
-    new_roles = after_roles - before_roles
+# --- Periodic scan: detect new Accelerate members from ClickUp ---
+@tasks.loop(hours=6)
+async def scan_new_accelerate_members():
+    """Check ClickUp for Accelerate members not yet in the pending queue."""
+    accelerate_usernames = await fetch_accelerate_usernames()
+    if not accelerate_usernames:
+        return
 
-    if new_roles & CHECKIN_ROLES and is_eligible_member(after):
-        pending = load_pending()
-        user_key = str(after.id)
-        if user_key not in pending:
+    pending = load_pending()
+    added = 0
+
+    for guild in client.guilds:
+        for member in guild.members:
+            if member.bot:
+                continue
+            if member.name.lower() not in accelerate_usernames:
+                continue
+            if not is_within_join_window(member):
+                continue
+            user_key = str(member.id)
+            if user_key in pending:
+                continue
+            if has_checked_in(member.id):
+                continue
             pending[user_key] = {
-                "guild_id": after.guild.id,
+                "guild_id": guild.id,
                 "added_at": datetime.now().isoformat(),
                 "step": 1,
             }
-            save_pending(pending)
-            print(f"[PENDING] {after.display_name} added — first check-in in 7 days")
+            added += 1
+            print(f"[PENDING] {member.display_name} added via ClickUp scan — first check-in in 7 days")
+
+    if added:
+        save_pending(pending)
+    print(f"[SCAN] Checked {len(accelerate_usernames)} Accelerate members, added {added} new")
+
+
+@scan_new_accelerate_members.before_loop
+async def before_scan():
+    await client.wait_until_ready()
 
 
 # Messages for each step of the new-member check-in sequence
@@ -776,10 +858,12 @@ async def _send_checkin_dms(label: str, message: str):
     - Exponential backoff on 429 rate limits
     - Cross-guild deduplication
     """
+    accelerate_usernames = await fetch_accelerate_usernames()
     pending = load_pending()
     sent = 0
     skipped = 0
     dm_blocked = 0
+    ineligible = 0
     seen_users = set()  # Dedupe across guilds
 
     for guild in client.guilds:
@@ -787,8 +871,11 @@ async def _send_checkin_dms(label: str, message: str):
             if member.bot or member.id in seen_users:
                 continue
             seen_users.add(member.id)
-            # Only DM eligible members (Accelerate role + joined within 7 months)
-            if not is_eligible_member(member):
+            # Only DM members in ClickUp Accelerate program + within join window
+            if member.name.lower() not in accelerate_usernames:
+                continue
+            if not is_within_join_window(member):
+                ineligible += 1
                 continue
             if str(member.id) in pending:
                 continue
@@ -826,7 +913,7 @@ async def _send_checkin_dms(label: str, message: str):
             except Exception as e:
                 print(f"[ERROR] DM to {member.display_name}: {e}")
 
-    print(f"[{label.upper()}] Sent: {sent}, Skipped (checked in): {skipped}, DM-blocked: {dm_blocked}")
+    print(f"[{label.upper()}] Sent: {sent}, Skipped (checked in): {skipped}, DM-blocked: {dm_blocked}, Join-date filtered: {ineligible}")
 
 
 @tasks.loop(time=monday_time)
@@ -1007,6 +1094,8 @@ async def on_ready():
             midweek_reminder.start()
         if not check_pending_members.is_running():
             check_pending_members.start()
+        if not scan_new_accelerate_members.is_running():
+            scan_new_accelerate_members.start()
         if not monthly_export.is_running():
             monthly_export.start()
 
