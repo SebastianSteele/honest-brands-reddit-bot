@@ -389,7 +389,7 @@ async def update_member_profile(task_id: str, stage: str,
         # Update Weeks in Stage (number field)
         if weeks:
             try:
-                await _set_field(CU_FIELD_WEEKS_IN_STAGE, int(weeks), "Weeks in Stage")
+                await _set_field(CU_FIELD_WEEKS_IN_STAGE, float(weeks), "Weeks in Stage")
             except ValueError:
                 errors.append(f"Weeks in Stage: invalid number '{weeks}'")
 
