@@ -17,6 +17,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
 CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
 CLICKUP_MEMBER_DB_LIST_ID = "901516122313"
+EXPORT_WEBHOOK_URL = os.getenv("EXPORT_WEBHOOK_URL", "")
 
 # --- Validate required env vars at import time ---
 _missing = [k for k, v in {
@@ -757,6 +758,102 @@ async def before_check_pending():
     await client.wait_until_ready()
 
 
+# --- Monthly check-in data export ---
+@tasks.loop(hours=24)
+async def monthly_export():
+    """On the 1st of each month, export all check-in tasks from ClickUp for AI analysis."""
+    now_est = datetime.now(timezone(timedelta(hours=-5)))
+    if now_est.day != 1:
+        return
+
+    month_label = now_est.strftime("%Y-%m")
+    month_start_ms = int(now_est.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    # Go back one full month
+    if now_est.month == 1:
+        prev_month = now_est.replace(year=now_est.year - 1, month=12, day=1)
+    else:
+        prev_month = now_est.replace(month=now_est.month - 1, day=1)
+    prev_month_ms = int(prev_month.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+
+    headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
+    all_tasks = []
+    page = 0
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(
+                    f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task",
+                    params={
+                        "include_closed": "true",
+                        "date_created_gt": prev_month_ms,
+                        "date_created_lt": month_start_ms,
+                        "page": page,
+                    },
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[EXPORT] ClickUp fetch failed: {resp.status}")
+                        return
+                    data = await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"[EXPORT] Network error: {e}")
+                return
+
+            batch = data.get("tasks", [])
+            if not batch:
+                break
+            all_tasks.extend(batch)
+            page += 1
+
+    export = {
+        "export_month": month_label,
+        "generated_at": now_est.isoformat(),
+        "total_checkins": len(all_tasks),
+        "checkins": [
+            {
+                "name": t.get("name"),
+                "created_at": t.get("date_created"),
+                "description": t.get("description", ""),
+                "tags": [tag.get("name") for tag in t.get("tags", [])],
+            }
+            for t in all_tasks
+        ],
+    }
+
+    export_json = json.dumps(export, indent=2)
+    print(f"[EXPORT] {month_label}: {len(all_tasks)} check-ins exported")
+
+    if EXPORT_WEBHOOK_URL:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    EXPORT_WEBHOOK_URL,
+                    json=export,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status < 300:
+                        print(f"[EXPORT] Sent to webhook successfully")
+                    else:
+                        print(f"[EXPORT] Webhook returned {resp.status}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f"[EXPORT] Webhook error: {e}")
+    else:
+        # No webhook — write to file as fallback
+        export_dir = os.path.join(os.path.dirname(__file__), "exports")
+        os.makedirs(export_dir, exist_ok=True)
+        export_path = os.path.join(export_dir, f"checkins_{month_label}.json")
+        with open(export_path, "w") as f:
+            f.write(export_json)
+        print(f"[EXPORT] Written to {export_path}")
+
+
+@monthly_export.before_loop
+async def before_monthly_export():
+    await client.wait_until_ready()
+
+
 # --- Bot ready ---
 _synced = False
 
@@ -798,6 +895,8 @@ async def on_ready():
             midweek_reminder.start()
         if not check_pending_members.is_running():
             check_pending_members.start()
+        if not monthly_export.is_running():
+            monthly_export.start()
 
 
 client.run(DISCORD_TOKEN)
