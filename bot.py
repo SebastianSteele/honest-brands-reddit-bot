@@ -62,7 +62,7 @@ STAGE_TO_MILESTONE = {
     "2. Building a store": "2. Build Site",
     "3. Creating ads": "3. Make Ads",
     "4. Getting sales": "4. First Sale",
-    "5. Scaling": "Scaling",
+    "5. Scaling": "5. Scaling",
 }
 
 # Only DM members who joined within this many months
