@@ -38,6 +38,9 @@ CU_FIELD_BLOCKER = "84fe7f3d-716c-4cd2-98c6-1a088c32d104"
 CU_FIELD_WHAT_WOULD_HELP = "074c35ab-2ad6-466c-ab8e-685aea688d86"
 CU_FIELD_NEXT_STEPS = "414d79b2-d1ab-47b8-981e-428b55f7533a"
 
+# Last Weekly Check-in Date — date field on the Member Database
+CU_FIELD_LAST_CHECKIN_DATE = "b504e08a-086f-402b-a76f-f5b158896b4c"
+
 # ClickUp Program Name field (dropdown) — used to identify Accelerate members
 CU_FIELD_PROGRAM_NAME = "d44e9584-d751-40fb-9b52-0cb7fb9d80aa"
 CU_PROGRAM_ACCELERATE_INDEX = 1  # orderindex for "Accelerate" in the dropdown
@@ -382,6 +385,9 @@ async def update_member_profile(task_id: str, stage: str,
 
         # Update Last Activity Date
         await _set_field(CU_FIELD_LAST_ACTIVITY_DATE, now_ms, "Last Activity Date")
+
+        # Update Last Weekly Check-in Date (separate date column)
+        await _set_field(CU_FIELD_LAST_CHECKIN_DATE, now_ms, "Last Weekly Check-in Date")
 
         # Update Last Activity text
         await _set_field(CU_FIELD_LAST_ACTIVITY, "Weekly Check-in", "Last Activity")
