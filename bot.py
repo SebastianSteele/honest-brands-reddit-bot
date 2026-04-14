@@ -8,6 +8,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 import aiohttp
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -238,9 +239,9 @@ STAGE_OPTIONS = [
 
 # --- Weekly check-in tracking ---
 def _get_week_start():
-    """Monday 00:00 EST of current week as ISO string."""
-    _est = timezone(timedelta(hours=-5))
-    now = datetime.now(_est)
+    """Monday 00:00 US/Eastern of current week as ISO string."""
+    _et = ZoneInfo("America/New_York")
+    now = datetime.now(_et)
     monday = now - timedelta(days=now.weekday())
     return monday.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None).isoformat()
 
@@ -274,8 +275,8 @@ def has_checked_in(user_id) -> bool:
 
 def record_checkin(user_id):
     data = _ensure_current_week(_load_checkin_data())
-    _est = timezone(timedelta(hours=-5))
-    data["checkins"][str(user_id)] = datetime.now(_est).isoformat()
+    _et = ZoneInfo("America/New_York")
+    data["checkins"][str(user_id)] = datetime.now(_et).isoformat()
     _save_checkin_data(data)
 
 
@@ -921,9 +922,9 @@ async def check_pending_members():
 
 
 # --- Auto-DM tasks (for existing members with accelerate/core roles) ---
-est = timezone(timedelta(hours=-5))
-monday_time = datetime.now(est).replace(hour=9, minute=0, second=0).timetz()
-wednesday_time = datetime.now(est).replace(hour=12, minute=0, second=0).timetz()
+et = ZoneInfo("America/New_York")
+monday_time = datetime.now(et).replace(hour=9, minute=0, second=0).timetz()
+wednesday_time = datetime.now(et).replace(hour=12, minute=0, second=0).timetz()
 
 
 async def _send_checkin_dms(label: str, message: str):
@@ -997,7 +998,7 @@ async def _send_checkin_dms(label: str, message: str):
 
 @tasks.loop(time=monday_time)
 async def weekly_reminder():
-    if datetime.now(est).weekday() != 0:
+    if datetime.now(et).weekday() != 0:
         return
     await _send_checkin_dms(
         "weekly",
@@ -1010,7 +1011,7 @@ async def weekly_reminder():
 
 @tasks.loop(time=wednesday_time)
 async def midweek_reminder():
-    if datetime.now(est).weekday() != 2:
+    if datetime.now(et).weekday() != 2:
         return
     await _send_checkin_dms(
         "midweek",
@@ -1040,7 +1041,7 @@ async def before_check_pending():
 @tasks.loop(hours=24)
 async def monthly_export():
     """On the 1st of each month, export all check-in tasks from ClickUp for AI analysis."""
-    now_est = datetime.now(timezone(timedelta(hours=-5)))
+    now_est = datetime.now(ZoneInfo("America/New_York"))
     if now_est.day != 1:
         return
 
