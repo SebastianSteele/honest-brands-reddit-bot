@@ -802,6 +802,7 @@ async def backfill_enrichment(interaction: discord.Interaction):
     updated = 0
     skipped = 0
     no_match = 0
+    failures = []  # track why each task failed
 
     for task in checkins:
         task_id = task["id"]
@@ -809,8 +810,8 @@ async def backfill_enrichment(interaction: discord.Interaction):
         tags = [t.get("name", "") for t in task.get("tags", [])]
         desc = task.get("description", "") or ""
 
-        # Skip already enriched
-        if "**Program:**" in desc and "**Discord Username:**" in desc:
+        # Skip already enriched (has Discord Username in desc, or no Discord ID to resolve)
+        if "**Discord Username:**" in desc:
             skipped += 1
             continue
 
@@ -827,20 +828,23 @@ async def backfill_enrichment(interaction: discord.Interaction):
 
         if not discord_id:
             no_match += 1
+            failures.append(f"{task_name} — no Discord ID found")
             continue
 
         # Resolve via Discord gateway (bot has access to users)
         try:
             user = await bot.fetch_user(int(discord_id))
             username = user.name
-        except Exception:
+        except Exception as e:
             no_match += 1
+            failures.append(f"{task_name} — Discord lookup failed ({discord_id}): {e}")
             continue
 
         # Match to member DB
         member = members_by_discord.get(username.lower())
         if not member:
             no_match += 1
+            failures.append(f"{task_name} — @{username} not in Member DB")
             continue
 
         # Enrich
@@ -878,12 +882,17 @@ async def backfill_enrichment(interaction: discord.Interaction):
         updated += 1
         await asyncio.sleep(1)  # rate limit
 
+    failure_text = ""
+    if failures:
+        failure_text = "\n\n**Unmatched:**\n" + "\n".join(f"• {f}" for f in failures)
+
     await interaction.followup.send(
         f"**Backfill complete**\n"
         f"Updated: {updated}\n"
         f"Already enriched: {skipped}\n"
         f"No match: {no_match}\n"
-        f"Total: {len(checkins)}",
+        f"Total: {len(checkins)}"
+        f"{failure_text}",
         ephemeral=True,
     )
 
