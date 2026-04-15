@@ -833,7 +833,7 @@ async def backfill_enrichment(interaction: discord.Interaction):
 
         # Resolve via Discord gateway (bot has access to users)
         try:
-            user = await bot.fetch_user(int(discord_id))
+            user = await client.fetch_user(int(discord_id))
             username = user.name
         except Exception as e:
             no_match += 1
