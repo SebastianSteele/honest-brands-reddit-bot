@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import asyncio
 import random
 import discord
@@ -45,6 +46,12 @@ CU_FIELD_LAST_CHECKIN_DATE = "b504e08a-086f-402b-a76f-f5b158896b4c"
 # ClickUp Program Name field (dropdown) — used to identify Accelerate members
 CU_FIELD_PROGRAM_NAME = "d44e9584-d751-40fb-9b52-0cb7fb9d80aa"
 CU_PROGRAM_ACCELERATE_INDEX = 1  # orderindex for "Accelerate" in the dropdown
+
+# ClickUp Member Database — Coach field (users type)
+CU_FIELD_COACH = "3c4c9ce5-07f5-4aa3-a0bf-1dbca6c9efe3"
+
+# Program Name dropdown options (orderindex → name)
+PROGRAM_NAMES = {0: "Core", 1: "Accelerate", 2: "Scale", 3: "Velocity"}
 
 # ClickUp Check-in List field IDs (populated on each task)
 CI_FIELD_BLOCKER = "84fe7f3d-716c-4cd2-98c6-1a088c32d104"
@@ -484,7 +491,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
             "name": f"Check-in — {interaction.user.display_name} — {today}",
             "description": (
                 f"**Member:** {interaction.user.display_name}\n"
-                f"**Discord ID:** {interaction.user.id}\n"
+                f"**Discord Username:** {interaction.user.name}\n"
                 f"**Date:** {today}\n\n"
                 f"---\n\n"
                 f"**Stage:** {self.selected_stage}\n\n"
@@ -494,7 +501,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                 f"**Next Steps:** {self.next_steps.value}"
             ),
             "priority": 3,
-            "tags": ["check-in", f"uid:{interaction.user.id}"],
+            "tags": ["check-in", interaction.user.name],
             "custom_fields": [
                 {"id": CI_FIELD_MEMBER, "value": interaction.user.display_name},
                 {"id": CI_FIELD_DATE, "value": today},
@@ -511,6 +518,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         cu_status = None
+        checkin_task_id = None
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -520,7 +528,10 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     cu_status = resp.status
-                    if cu_status != 200:
+                    if cu_status == 200:
+                        resp_data = await resp.json()
+                        checkin_task_id = resp_data.get("id")
+                    else:
                         body = await resp.text()
                         print(f"[ERROR] ClickUp API: {cu_status} — {body}")
 
@@ -536,7 +547,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                 )
                 print(f"[OK] Check-in from {interaction.user.display_name}")
 
-                # Update member profile in background (non-blocking async task)
+                # Update member profile + enrich check-in task in background
                 asyncio.create_task(_update_member_after_checkin(
                     discord_username=interaction.user.name,
                     display_name=interaction.user.display_name,
@@ -545,6 +556,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                     blocker=self.blocker.value,
                     help_needed=self.help_needed.value,
                     next_steps=self.next_steps.value,
+                    checkin_task_id=checkin_task_id,
                 ))
             else:
                 await interaction.followup.send(
@@ -560,8 +572,9 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
 
 
 async def _update_member_after_checkin(discord_username, display_name, stage,
-                                       weeks, blocker, help_needed, next_steps):
-    """Background task to update ClickUp member profile after check-in."""
+                                       weeks, blocker, help_needed, next_steps,
+                                       checkin_task_id=None):
+    """Background task to update ClickUp member profile and enrich check-in task."""
     try:
         member_task = await find_member_by_discord(discord_username)
         if member_task:
@@ -571,10 +584,94 @@ async def _update_member_after_checkin(discord_username, display_name, stage,
                 what_would_help=help_needed, next_steps=next_steps,
             )
             print(f"[CLICKUP] Member profile updated for {display_name}")
+
+            # Enrich check-in task with program and coach info
+            if checkin_task_id:
+                await _enrich_checkin_task(checkin_task_id, member_task, discord_username)
         else:
             print(f"[CLICKUP] No matching member for {display_name} (username: {discord_username})")
     except Exception as e:
         print(f"[CLICKUP] Error updating member {display_name}: {e}")
+
+
+def _extract_member_info(member_task):
+    """Extract program name and coach names from a member database task."""
+    program = None
+    coaches = []
+    for cf in member_task.get("custom_fields", []):
+        if cf.get("id") == CU_FIELD_PROGRAM_NAME and cf.get("value") is not None:
+            try:
+                program = PROGRAM_NAMES.get(int(cf["value"]))
+            except (ValueError, TypeError):
+                pass
+        elif cf.get("id") == CU_FIELD_COACH and cf.get("value"):
+            coaches = [u.get("username", "") for u in cf["value"] if u.get("username")]
+    return program, coaches
+
+
+async def _enrich_checkin_task(checkin_task_id, member_task, discord_username):
+    """Add program, coach, and Discord username tags + update description on a check-in task."""
+    headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
+    program, coaches = _extract_member_info(member_task)
+
+    # Build tags to add
+    tags = []
+    if program:
+        tags.append(program.lower())
+    for coach in coaches:
+        tags.append(coach.lower())
+
+    async with aiohttp.ClientSession() as session:
+        # Add tags
+        for tag in tags:
+            try:
+                async with session.post(
+                    f"https://api.clickup.com/api/v2/task/{checkin_task_id}/tag/{tag}",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        print(f"[CLICKUP] Failed to add tag '{tag}': {r.status} {body}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"[CLICKUP] Error adding tag '{tag}': {e}")
+
+        # Update description to include program and coach
+        try:
+            async with session.get(
+                f"https://api.clickup.com/api/v2/task/{checkin_task_id}",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status == 200:
+                    task_data = await r.json()
+                    old_desc = task_data.get("description", "")
+                    extra_lines = []
+                    if program:
+                        extra_lines.append(f"**Program:** {program}")
+                    if coaches:
+                        extra_lines.append(f"**Coach:** {', '.join(coaches)}")
+                    if extra_lines:
+                        # Insert after the Date line
+                        new_desc = old_desc.replace(
+                            "\n\n---",
+                            "\n" + "\n".join(extra_lines) + "\n\n---",
+                            1,
+                        )
+                        async with session.put(
+                            f"https://api.clickup.com/api/v2/task/{checkin_task_id}",
+                            json={"description": new_desc},
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as r2:
+                            if r2.status == 200:
+                                print(f"[CLICKUP] Enriched check-in {checkin_task_id} "
+                                      f"(program={program}, coaches={coaches})")
+                            else:
+                                body = await r2.text()
+                                print(f"[CLICKUP] Failed to update description: {r2.status} {body}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f"[CLICKUP] Error enriching check-in task: {e}")
 
 
 # --- Stage Select Menu (dropdown before modal) ---
@@ -649,6 +746,146 @@ async def trigger_checkins(interaction: discord.Interaction):
     except Exception as e:
         print(f"[ERROR] trigger_checkins: {e}")
         await interaction.followup.send(f"⚠️ Error: {e}", ephemeral=True)
+
+
+# --- Admin command: show eligibility status for all Accelerate members ---
+@tree.command(name="backfill_enrichment",
+              description="[Admin] Enrich unmatched check-in tasks with Discord username, program, coach")
+@app_commands.default_permissions(administrator=True)
+async def backfill_enrichment(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
+
+    # Fetch all members indexed by Discord username
+    members_by_discord = {}
+    page = 0
+    async with aiohttp.ClientSession() as session:
+        while True:
+            async with session.get(
+                f"https://api.clickup.com/api/v2/list/{CLICKUP_MEMBER_DB_LIST_ID}/task",
+                params={"include_closed": "true", "subtasks": "true", "page": page},
+                headers=headers, timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    break
+                data = await resp.json()
+            task_list = data.get("tasks", [])
+            if not task_list:
+                break
+            for t in task_list:
+                for cf in t.get("custom_fields", []):
+                    if cf.get("id") == CU_FIELD_DISCORD_USERNAME:
+                        val = (cf.get("value") or "").strip().lower()
+                        if val:
+                            members_by_discord[val] = t
+            page += 1
+
+    # Fetch all check-in tasks
+    checkins = []
+    page = 0
+    async with aiohttp.ClientSession() as session:
+        while True:
+            async with session.get(
+                f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task",
+                params={"include_closed": "true", "page": page},
+                headers=headers, timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    break
+                data = await resp.json()
+            batch = data.get("tasks", [])
+            if not batch:
+                break
+            checkins.extend(batch)
+            page += 1
+
+    updated = 0
+    skipped = 0
+    no_match = 0
+
+    for task in checkins:
+        task_id = task["id"]
+        task_name = task.get("name", "")
+        tags = [t.get("name", "") for t in task.get("tags", [])]
+        desc = task.get("description", "") or ""
+
+        # Skip already enriched
+        if "**Program:**" in desc and "**Discord Username:**" in desc:
+            skipped += 1
+            continue
+
+        # Get Discord numeric ID from uid: tag or description
+        discord_id = None
+        for tag in tags:
+            if tag.startswith("uid:"):
+                discord_id = tag[4:]
+                break
+        if not discord_id:
+            match = re.search(r'\*\*Discord ID:\*\*\s*(\d+)', desc)
+            if match:
+                discord_id = match.group(1)
+
+        if not discord_id:
+            no_match += 1
+            continue
+
+        # Resolve via Discord gateway (bot has access to users)
+        try:
+            user = await bot.fetch_user(int(discord_id))
+            username = user.name
+        except Exception:
+            no_match += 1
+            continue
+
+        # Match to member DB
+        member = members_by_discord.get(username.lower())
+        if not member:
+            no_match += 1
+            continue
+
+        # Enrich
+        await _enrich_checkin_task(task_id, member, username)
+
+        # Also replace Discord ID with username in description
+        new_desc = re.sub(
+            r'\*\*Discord ID:\*\*\s*\d+',
+            f'**Discord Username:** {username}',
+            desc,
+        )
+        if new_desc != desc:
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    f"https://api.clickup.com/api/v2/task/{task_id}",
+                    json={"description": new_desc},
+                    headers=headers, timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    pass
+
+        # Replace uid: tag with username tag
+        for tag in tags:
+            if tag.startswith("uid:"):
+                async with aiohttp.ClientSession() as session:
+                    await session.delete(
+                        f"https://api.clickup.com/api/v2/task/{task_id}/tag/{tag}",
+                        headers=headers, timeout=aiohttp.ClientTimeout(total=10),
+                    )
+        async with aiohttp.ClientSession() as session:
+            await session.post(
+                f"https://api.clickup.com/api/v2/task/{task_id}/tag/{username.lower()}",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10),
+            )
+
+        updated += 1
+        await asyncio.sleep(1)  # rate limit
+
+    await interaction.followup.send(
+        f"**Backfill complete**\n"
+        f"Updated: {updated}\n"
+        f"Already enriched: {skipped}\n"
+        f"No match: {no_match}\n"
+        f"Total: {len(checkins)}",
+        ephemeral=True,
+    )
 
 
 # --- Admin command: show eligibility status for all Accelerate members ---
