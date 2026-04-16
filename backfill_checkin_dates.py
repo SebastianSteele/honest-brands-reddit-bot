@@ -10,6 +10,7 @@ Dry-run:   python3 backfill_checkin_dates.py --dry-run
 """
 import os
 import sys
+import time
 from datetime import datetime
 import requests
 from dotenv import load_dotenv
@@ -37,8 +38,12 @@ def main():
         sys.exit(1)
 
     dry_run = "--dry-run" in sys.argv
+    force = "--force" in sys.argv
     if dry_run:
-        print("=== DRY RUN — no changes will be made ===\n")
+        print("=== DRY RUN — no changes will be made ===")
+    if force:
+        print("=== FORCE MODE — will overwrite existing dates ===")
+    print()
 
     headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
 
@@ -128,6 +133,7 @@ def main():
     updated = 0
     already_set = 0
     no_checkin_found = 0
+    cleared = 0
     errors = 0
 
     for member in members:
@@ -140,7 +146,7 @@ def main():
             if cf["id"] == CU_FIELD_LAST_CHECKIN_DATE:
                 current_checkin_date = cf.get("value")
 
-        if current_checkin_date:
+        if current_checkin_date and not force:
             already_set += 1
             continue
 
@@ -151,7 +157,27 @@ def main():
         # If no match by name, no uid-based match possible from member DB
         # (we don't have Discord user ID on the member DB task itself)
         if not latest_ms:
-            no_checkin_found += 1
+            # If they have a date set but no actual check-in, clear it
+            if current_checkin_date and force:
+                if dry_run:
+                    print(f"  WOULD CLEAR: {name} (no check-in found, bad backfill)")
+                    cleared += 1
+                    continue
+                r = requests.post(
+                    f"https://api.clickup.com/api/v2/task/{task_id}/field/{CU_FIELD_LAST_CHECKIN_DATE}",
+                    json={"value": ""},
+                    headers=headers,
+                    timeout=10,
+                )
+                time.sleep(0.5)
+                if r.status_code == 200:
+                    print(f"  CLEARED: {name}")
+                    cleared += 1
+                else:
+                    print(f"  ERROR clearing {name} — {r.status_code} {r.text}")
+                    errors += 1
+            else:
+                no_checkin_found += 1
             continue
 
         if dry_run:
@@ -166,6 +192,7 @@ def main():
             headers=headers,
             timeout=10,
         )
+        time.sleep(0.5)
         if r.status_code == 200:
             dt = datetime.fromtimestamp(latest_ms / 1000)
             print(f"  OK: {name} → {dt.strftime('%b %d, %Y')}")
@@ -177,6 +204,7 @@ def main():
     label = "DRY RUN SUMMARY" if dry_run else "SUMMARY"
     print(f"\n=== {label} ===")
     print(f"  Updated:          {updated}")
+    print(f"  Cleared:          {cleared}")
     print(f"  Already set:      {already_set}")
     print(f"  No check-in found:{no_checkin_found}")
     print(f"  Errors:           {errors}")
