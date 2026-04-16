@@ -646,6 +646,10 @@ async def _enrich_checkin_task(checkin_task_id, member_task, discord_username):
                     task_data = await r.json()
                     old_desc = task_data.get("description", "")
                     extra_lines = []
+                    # Add full name from member database task name
+                    member_full_name = (member_task.get("name") or "").strip()
+                    if member_full_name:
+                        extra_lines.append(f"**Full Name:** {member_full_name}")
                     if program:
                         extra_lines.append(f"**Program:** {program}")
                     if coaches:

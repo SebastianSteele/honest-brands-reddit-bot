@@ -112,7 +112,7 @@ def get_checkin_member_name(task):
     return None
 
 
-def update_task_description(task_id, old_desc, discord_username, program, coaches, dry_run):
+def update_task_description(task_id, old_desc, discord_username, program, coaches, dry_run, full_name=None):
     """Update the check-in task description with enrichment data."""
     # Replace **Discord ID:** line with **Discord Username:** line
     new_desc = re.sub(
@@ -128,6 +128,21 @@ def update_task_description(task_id, old_desc, discord_username, program, coache
             f'\\1**Discord Username:** {discord_username}\n',
             new_desc,
         )
+
+    # Add Full Name after Discord Username line if not already present
+    if full_name and "**Full Name:**" not in new_desc:
+        if "**Discord Username:**" in new_desc:
+            new_desc = re.sub(
+                r'(\*\*Discord Username:\*\*[^\n]*\n)',
+                f'\\1**Full Name:** {full_name}\n',
+                new_desc,
+            )
+        else:
+            new_desc = re.sub(
+                r'(\*\*Member:\*\*[^\n]*\n)',
+                f'\\1**Full Name:** {full_name}\n',
+                new_desc,
+            )
 
     # Add program and coach before the --- separator if not already present
     extra = []
@@ -231,8 +246,16 @@ def main():
         if len(parts) >= 2:
             extracted_name = parts[1].strip()
 
+        # Extract Discord username from task description (most reliable)
+        desc_discord_match = re.search(r'\*\*Discord Username:\*\*\s*(\S+)', desc)
+        desc_discord = desc_discord_match.group(1).strip().lower() if desc_discord_match else None
+
+        # Strategy 0: Match by Discord username from description → member DB Discord field
+        if not member and desc_discord:
+            member = by_discord.get(desc_discord)
+
         # Strategy 1: Exact match on member name custom field
-        if search_name:
+        if not member and search_name:
             member = by_name.get(search_name.lower())
 
         # Strategy 2: Exact match on name from task title
@@ -275,12 +298,13 @@ def main():
             continue
 
         program, coaches, discord_username = extract_member_info(member)
+        full_name = (member.get("name") or "").strip()
 
         # Check if already enriched
         already_has_program = any(t == (program or "").lower() for t in tags)
         already_has_coaches = all(c.lower() in tags for c in coaches) if coaches else True
         already_has_discord_tag = discord_username and discord_username.lower() in tags
-        desc_ok = ("**Program:**" in desc or not program) and ("**Coach:**" in desc or not coaches)
+        desc_ok = ("**Program:**" in desc or not program) and ("**Coach:**" in desc or not coaches) and ("**Full Name:**" in desc or not full_name)
 
         if already_has_program and already_has_coaches and already_has_discord_tag and desc_ok:
             skipped += 1
@@ -288,7 +312,7 @@ def main():
 
         print(f"  [{i+1}/{len(checkins)}] Enriching: {task_name}")
         print(f"    Program: {program}, Coach: {', '.join(coaches) if coaches else 'N/A'}, "
-              f"Discord: {discord_username or 'N/A'}")
+              f"Discord: {discord_username or 'N/A'}, Full Name: {full_name or 'N/A'}")
 
         # Add tags
         if program and not already_has_program:
@@ -305,12 +329,13 @@ def main():
                 remove_tag(task_id, tag, dry_run)
 
         # Update description
-        if discord_username or program or coaches:
+        if discord_username or program or coaches or full_name:
             update_task_description(
                 task_id, desc,
                 discord_username or "",
                 program, coaches,
                 dry_run,
+                full_name=full_name,
             )
 
         updated += 1
