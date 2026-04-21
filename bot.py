@@ -22,8 +22,6 @@ CLICKUP_MEMBER_DB_LIST_ID = "901516122313"
 EXPORT_WEBHOOK_URL = os.getenv("EXPORT_WEBHOOK_URL", "")
 # Optional: Number custom field on the *check-in* list — store band 1–4 (see HOURS_LABEL_TO_BAND).
 CI_FIELD_WEEKLY_HOURS_BAND = (os.getenv("CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND") or "").strip()
-# Optional: POST JSON on each successful check-in (e.g. Make.com → Google Sheets append row).
-CHECKIN_SHEETS_WEBHOOK_URL = (os.getenv("CHECKIN_SHEETS_WEBHOOK_URL") or "").strip()
 
 # --- Validate required env vars at import time ---
 _missing = [k for k, v in {
@@ -281,24 +279,6 @@ def _weekly_hours_band_from_task(task: dict):
     if m:
         return weekly_hours_band_for_label(m.group(1).strip())
     return None
-
-
-async def _post_checkin_sheets_webhook(payload: dict):
-    """Fire-and-forget row sync for Google Sheets (or any HTTP receiver)."""
-    if not CHECKIN_SHEETS_WEBHOOK_URL:
-        return
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                CHECKIN_SHEETS_WEBHOOK_URL,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as resp:
-                if resp.status >= 300:
-                    body = await resp.text()
-                    print(f"[SHEETS] Webhook returned {resp.status}: {body[:400]}")
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"[SHEETS] Webhook error: {e}")
 
 
 # --- Weekly check-in tracking ---
@@ -611,20 +591,6 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                     ephemeral=True,
                 )
                 print(f"[OK] Check-in from {interaction.user.display_name}")
-
-                _et = ZoneInfo("America/New_York")
-                asyncio.create_task(_post_checkin_sheets_webhook({
-                    "event": "checkin_submitted",
-                    "clickup_task_id": checkin_task_id,
-                    "discord_user_id": str(interaction.user.id),
-                    "discord_username": interaction.user.name,
-                    "display_name": interaction.user.display_name,
-                    "date": today,
-                    "stage": self.selected_stage,
-                    "weekly_hours_band": hours_band,
-                    "weekly_hours_label": self.weekly_hours,
-                    "iso_week": datetime.now(_et).isocalendar()[1],
-                }))
 
                 # Update member profile + enrich check-in task in background
                 asyncio.create_task(_update_member_after_checkin(
