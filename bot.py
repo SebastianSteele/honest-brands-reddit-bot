@@ -24,6 +24,14 @@ EXPORT_WEBHOOK_URL = os.getenv("EXPORT_WEBHOOK_URL", "")
 CLICKUP_WEEKLY_HOURS_FIELD_NAME = (os.getenv("CLICKUP_WEEKLY_HOURS_FIELD_NAME") or "").strip()
 # Optional: force this field UUID on the check-in list (skips list-field discovery).
 CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND = (os.getenv("CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND") or "").strip()
+# Display name used when auto-creating the Number field via POST /v2/list/{list_id}/field.
+CLICKUP_WEEKLY_HOURS_FIELD_DISPLAY_NAME = (
+    (os.getenv("CLICKUP_WEEKLY_HOURS_FIELD_DISPLAY_NAME") or "Weekly Number of Hours").strip()
+)
+# When true (default), create that field on the check-in list if it is missing.
+CLICKUP_AUTO_CREATE_WEEKLY_HOURS_FIELD = os.getenv(
+    "CLICKUP_AUTO_CREATE_WEEKLY_HOURS_FIELD", "true",
+).lower() not in ("0", "false", "no", "off")
 
 # --- Validate required env vars at import time ---
 _missing = [k for k, v in {
@@ -324,6 +332,50 @@ def _pick_weekly_hours_field(fields: list) -> dict | None:
     return None
 
 
+async def _try_create_weekly_hours_number_field(
+    session: aiohttp.ClientSession,
+    existing_fields: list,
+) -> dict | None:
+    """
+    ClickUp supports POST /v2/list/{list_id}/field to add a list-level custom field.
+    Creates a Number field for bands 1–4 unless a field with the same name already exists.
+    """
+    if not CLICKUP_AUTO_CREATE_WEEKLY_HOURS_FIELD:
+        return None
+    want = CLICKUP_WEEKLY_HOURS_FIELD_DISPLAY_NAME.strip().lower()
+    for f in existing_fields:
+        if (f.get("name") or "").strip().lower() == want:
+            return f
+    url = f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/field"
+    payload = {
+        "name": CLICKUP_WEEKLY_HOURS_FIELD_DISPLAY_NAME,
+        "type": "number",
+        "type_config": {},
+    }
+    try:
+        async with session.post(
+            url,
+            json=payload,
+            headers={"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            body = await resp.text()
+            if resp.status == 200:
+                try:
+                    data = json.loads(body)
+                except json.JSONDecodeError:
+                    print(f"[CLICKUP] Auto-create weekly hours: invalid JSON: {body[:300]}")
+                    return None
+                field = data.get("field")
+                if field:
+                    print(f"[CLICKUP] Created weekly hours field {field.get('name')!r} id={field.get('id')}")
+                    return field
+            print(f"[CLICKUP] Auto-create weekly hours field failed: {resp.status} {body[:500]}")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"[CLICKUP] Auto-create weekly hours field error: {e}")
+    return None
+
+
 async def get_weekly_hours_field_meta(session: aiohttp.ClientSession) -> dict | None:
     """GET /v2/list/{CLICKUP_LIST_ID}/field — cached per process."""
     forced = _forced_weekly_hours_meta()
@@ -355,11 +407,21 @@ async def get_weekly_hours_field_meta(session: aiohttp.ClientSession) -> dict | 
             return None
         fields = data.get("fields") or []
         meta = _pick_weekly_hours_field(fields)
+        if not meta:
+            want = CLICKUP_WEEKLY_HOURS_FIELD_DISPLAY_NAME.strip().lower()
+            for f in fields:
+                if (f.get("name") or "").strip().lower() == want:
+                    meta = f
+                    break
+        if not meta:
+            meta = await _try_create_weekly_hours_number_field(session, fields)
         if meta:
             print(f"[CLICKUP] Weekly hours field: {meta.get('name')!r} id={meta.get('id')} type={meta.get('type')}")
         else:
-            print("[CLICKUP] No weekly-hours field found — add a list field named e.g. "
-                  "'Weekly Number of Hours' (Number or Dropdown), then redeploy.")
+            print(
+                "[CLICKUP] No weekly hours field — set CLICKUP_AUTO_CREATE_WEEKLY_HOURS_FIELD=true "
+                "(default) or add a Number / Dropdown / Text field on the check-in list.",
+            )
         _wh_hours_field_cache["ready"] = True
         _wh_hours_field_cache["meta"] = meta
         return meta
