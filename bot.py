@@ -20,8 +20,10 @@ CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
 CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
 CLICKUP_MEMBER_DB_LIST_ID = "901516122313"
 EXPORT_WEBHOOK_URL = os.getenv("EXPORT_WEBHOOK_URL", "")
-# Optional: Number custom field on the *check-in* list — store band 1–4 (see HOURS_LABEL_TO_BAND).
-CI_FIELD_WEEKLY_HOURS_BAND = (os.getenv("CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND") or "").strip()
+# Optional override: force this custom field UUID on the check-in list (skips API discovery).
+CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND = (os.getenv("CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND") or "").strip()
+# Optional: exact field name on the check-in list (otherwise the bot picks number/dropdown + "hours" in name).
+CLICKUP_WEEKLY_HOURS_FIELD_NAME = (os.getenv("CLICKUP_WEEKLY_HOURS_FIELD_NAME") or "").strip()
 
 # --- Validate required env vars at import time ---
 _missing = [k for k, v in {
@@ -261,19 +263,164 @@ def weekly_hours_band_for_label(label: str):
     return HOURS_LABEL_TO_BAND.get(label)
 
 
-def _weekly_hours_band_from_task(task: dict):
-    """Resolve hours band from custom field (if configured) or task description."""
-    if CI_FIELD_WEEKLY_HOURS_BAND:
+# --- Weekly hours ClickUp field (same list as check-in tasks: CLICKUP_LIST_ID) ---
+_wh_hours_field_lock = asyncio.Lock()
+_wh_hours_field_cache: dict = {"ready": False, "meta": None}  # meta = field dict from GET /list/{id}/field
+
+
+def _pick_weekly_hours_field(fields: list) -> dict | None:
+    """Choose the weekly-hours field from list definitions (no hardcoded field UUID)."""
+    if CLICKUP_WEEKLY_HOURS_FIELD_NAME:
+        for f in fields:
+            if (f.get("name") or "").strip() == CLICKUP_WEEKLY_HOURS_FIELD_NAME:
+                return f
+        print(f"[CLICKUP] CLICKUP_WEEKLY_HOURS_FIELD_NAME={CLICKUP_WEEKLY_HOURS_FIELD_NAME!r} not on list")
+    candidates = []
+    for f in fields:
+        ty = f.get("type") or ""
+        if ty not in ("number", "drop_down"):
+            continue
+        n = (f.get("name") or "").lower()
+        if "hour" not in n:
+            continue
+        if any(k in n for k in ("week", "band", "spent")):
+            candidates.append(f)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        names = ", ".join((c.get("name") or "") for c in candidates)
+        print(f"[CLICKUP] Multiple weekly-hours fields ({names}) — using first. "
+              f"Set CLICKUP_WEEKLY_HOURS_FIELD_NAME to pick one.")
+        return candidates[0]
+    return None
+
+
+def _forced_weekly_hours_meta() -> dict | None:
+    """Optional env: known field id but no list metadata (assume number)."""
+    if not CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND:
+        return None
+    return {
+        "id": CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND,
+        "name": "(CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND)",
+        "type": "number",
+        "type_config": {},
+    }
+
+
+async def get_weekly_hours_field_meta(session: aiohttp.ClientSession) -> dict | None:
+    """
+    Resolve the weekly-hours custom field on the check-in list via
+    GET /v2/list/{CLICKUP_LIST_ID}/field. Cached per process.
+    """
+    forced = _forced_weekly_hours_meta()
+    if forced:
+        return forced
+    if _wh_hours_field_cache["ready"]:
+        return _wh_hours_field_cache["meta"]
+    async with _wh_hours_field_lock:
+        if _wh_hours_field_cache["ready"]:
+            return _wh_hours_field_cache["meta"]
+        url = f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/field"
+        try:
+            async with session.get(
+                url,
+                headers={"Authorization": CLICKUP_TOKEN},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"[CLICKUP] List fields fetch {resp.status}: {body[:400]}")
+                    _wh_hours_field_cache["ready"] = True
+                    _wh_hours_field_cache["meta"] = None
+                    return None
+                data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f"[CLICKUP] List fields fetch error: {e}")
+            _wh_hours_field_cache["ready"] = True
+            _wh_hours_field_cache["meta"] = None
+            return None
+        fields = data.get("fields") or []
+        meta = _pick_weekly_hours_field(fields)
+        if meta:
+            print(f"[CLICKUP] Weekly hours field on check-in list: "
+                  f"{meta.get('name')!r} id={meta.get('id')} type={meta.get('type')}")
+        else:
+            print("[CLICKUP] No weekly-hours custom field on check-in list — "
+                  "hours stay in description only until you add a Number or Dropdown field there.")
+        _wh_hours_field_cache["ready"] = True
+        _wh_hours_field_cache["meta"] = meta
+        return meta
+
+
+def _dropdown_option_id_for_label(field_meta: dict, label: str) -> str | None:
+    opts = (field_meta.get("type_config") or {}).get("options") or []
+    want = (label or "").strip().lower()
+    for o in opts:
+        if (o.get("name") or "").strip().lower() == want:
+            oid = o.get("id")
+            return str(oid) if oid is not None else None
+    return None
+
+
+def _band_from_task_weekly_hours_cf(field_meta: dict, raw) -> int | None:
+    """Parse band 1–4 from a task's custom field value + list field definition."""
+    if raw is None or raw == "":
+        return None
+    ty = field_meta.get("type") or ""
+    if ty == "number":
+        try:
+            n = int(float(raw))
+            if 1 <= n <= 4:
+                return n
+        except (TypeError, ValueError):
+            return None
+    if ty != "drop_down":
+        return None
+    opts = (field_meta.get("type_config") or {}).get("options") or []
+    sraw = str(raw)
+    for o in opts:
+        if str(o.get("id")) == sraw:
+            return weekly_hours_band_for_label((o.get("name") or "").strip())
+    try:
+        idx = int(float(raw))
+    except (TypeError, ValueError):
+        idx = None
+    if idx is not None:
+        for o in opts:
+            if o.get("orderindex") == idx:
+                return weekly_hours_band_for_label((o.get("name") or "").strip())
+    return None
+
+
+def weekly_hours_custom_field_entry(field_meta: dict | None, band: int | None, label: str) -> dict | None:
+    """Build one ClickUp custom_fields item for weekly hours, or None."""
+    if field_meta is None or band is None:
+        return None
+    fid = field_meta.get("id")
+    if not fid:
+        return None
+    ty = field_meta.get("type") or ""
+    if ty == "number":
+        return {"id": fid, "value": band}
+    if ty == "drop_down":
+        oid = _dropdown_option_id_for_label(field_meta, label)
+        if oid:
+            return {"id": fid, "value": oid}
+        print(f"[CLICKUP] Dropdown weekly hours field has no option matching label {label!r}")
+        return None
+    return None
+
+
+def _weekly_hours_band_from_task(task: dict, field_meta: dict | None = None):
+    """Resolve hours band from custom field (resolved meta) or task description."""
+    if field_meta and field_meta.get("id"):
         for cf in task.get("custom_fields") or []:
-            if cf.get("id") != CI_FIELD_WEEKLY_HOURS_BAND:
+            if cf.get("id") != field_meta["id"]:
                 continue
-            raw = cf.get("value")
-            if raw is None or raw == "":
-                break
-            try:
-                return int(float(raw))
-            except (TypeError, ValueError):
-                break
+            b = _band_from_task_weekly_hours_cf(field_meta, cf.get("value"))
+            if b is not None:
+                return b
+            break
     desc = task.get("description") or ""
     m = re.search(r"\*\*Hours Spent This Week:\*\*\s*(.+?)(?:\n|$)", desc, re.IGNORECASE)
     if m:
@@ -526,7 +673,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
             "Authorization": CLICKUP_TOKEN,
             "Content-Type": "application/json",
         }
-        custom_fields = [
+        base_custom_fields = [
             {"id": CI_FIELD_MEMBER, "value": interaction.user.display_name},
             {"id": CI_FIELD_DATE, "value": today},
             {"id": CI_FIELD_STAGE, "value": self.selected_stage},
@@ -536,28 +683,6 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
             {"id": CI_FIELD_WHAT_WOULD_HELP, "value": self.help_needed.value},
             {"id": CI_FIELD_NEXT_STEPS, "value": self.next_steps.value},
         ]
-        if CI_FIELD_WEEKLY_HOURS_BAND and hours_band is not None:
-            custom_fields.append(
-                {"id": CI_FIELD_WEEKLY_HOURS_BAND, "value": hours_band},
-            )
-        task_data = {
-            "name": f"Check-in — {interaction.user.display_name} — {today}",
-            "description": (
-                f"**Member:** {interaction.user.display_name}\n"
-                f"**Discord Username:** {interaction.user.name}\n"
-                f"**Date:** {today}\n\n"
-                f"---\n\n"
-                f"**Stage:** {self.selected_stage}\n\n"
-                f"**Hours Spent This Week:** {self.weekly_hours}\n\n"
-                f"**Weeks in Stage:** {self.weeks.value}\n\n"
-                f"**Blocker:** {self.blocker.value}\n\n"
-                f"**What Would Help:** {self.help_needed.value}\n\n"
-                f"**Next Steps:** {self.next_steps.value}"
-            ),
-            "priority": 3,
-            "tags": ["check-in", interaction.user.name],
-            "custom_fields": custom_fields,
-        }
 
         # Respond to Discord immediately (must be within 3 seconds)
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -566,6 +691,31 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
         checkin_task_id = None
         try:
             async with aiohttp.ClientSession() as session:
+                wh_meta = await get_weekly_hours_field_meta(session)
+                custom_fields = list(base_custom_fields)
+                wh_entry = weekly_hours_custom_field_entry(
+                    wh_meta, hours_band, self.weekly_hours,
+                )
+                if wh_entry:
+                    custom_fields.append(wh_entry)
+                task_data = {
+                    "name": f"Check-in — {interaction.user.display_name} — {today}",
+                    "description": (
+                        f"**Member:** {interaction.user.display_name}\n"
+                        f"**Discord Username:** {interaction.user.name}\n"
+                        f"**Date:** {today}\n\n"
+                        f"---\n\n"
+                        f"**Stage:** {self.selected_stage}\n\n"
+                        f"**Hours Spent This Week:** {self.weekly_hours}\n\n"
+                        f"**Weeks in Stage:** {self.weeks.value}\n\n"
+                        f"**Blocker:** {self.blocker.value}\n\n"
+                        f"**What Would Help:** {self.help_needed.value}\n\n"
+                        f"**Next Steps:** {self.next_steps.value}"
+                    ),
+                    "priority": 3,
+                    "tags": ["check-in", interaction.user.name],
+                    "custom_fields": custom_fields,
+                }
                 async with session.post(
                     f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task",
                     json=task_data,
@@ -1238,6 +1388,7 @@ async def monthly_export():
     page = 0
 
     async with aiohttp.ClientSession() as session:
+        wh_meta = await get_weekly_hours_field_meta(session)
         while True:
             try:
                 async with session.get(
@@ -1275,7 +1426,7 @@ async def monthly_export():
                 "created_at": t.get("date_created"),
                 "description": t.get("description", ""),
                 "tags": [tag.get("name") for tag in t.get("tags", [])],
-                "weekly_hours_band": _weekly_hours_band_from_task(t),
+                "weekly_hours_band": _weekly_hours_band_from_task(t, wh_meta),
             }
             for t in all_tasks
         ],
@@ -1315,6 +1466,15 @@ async def before_monthly_export():
 
 # --- Bot ready ---
 _synced = False
+
+
+async def _prefetch_weekly_hours_field():
+    """Resolve weekly-hours field once at startup so first check-in is faster."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            await get_weekly_hours_field_meta(session)
+    except Exception as e:
+        print(f"[CLICKUP] Weekly hours field prefetch: {e}")
 
 
 @client.event
@@ -1358,6 +1518,7 @@ async def on_ready():
             scan_new_accelerate_members.start()
         if not monthly_export.is_running():
             monthly_export.start()
+        asyncio.create_task(_prefetch_weekly_hours_field())
 
 
 client.run(DISCORD_TOKEN)
