@@ -20,10 +20,10 @@ CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
 CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
 CLICKUP_MEMBER_DB_LIST_ID = "901516122313"
 EXPORT_WEBHOOK_URL = os.getenv("EXPORT_WEBHOOK_URL", "")
-# Optional override: force this custom field UUID on the check-in list (skips API discovery).
-CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND = (os.getenv("CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND") or "").strip()
-# Optional: exact field name on the check-in list (otherwise the bot picks number/dropdown + "hours" in name).
+# Optional: exact name of the weekly-hours custom field on the check-in list (see CANONICAL_WEEKLY_HOURS_FIELD_NAMES).
 CLICKUP_WEEKLY_HOURS_FIELD_NAME = (os.getenv("CLICKUP_WEEKLY_HOURS_FIELD_NAME") or "").strip()
+# Optional: force this field UUID on the check-in list (skips list-field discovery).
+CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND = (os.getenv("CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND") or "").strip()
 
 # --- Validate required env vars at import time ---
 _missing = [k for k, v in {
@@ -254,8 +254,16 @@ HOURS_OPTIONS = [
     ("10+ hours", "10+ hours"),
 ]
 
-# Band sent to ClickUp / Sheets: 1 = <1h, 2 = 2–4h, 3 = 5–10h, 4 = 10+h
+# Band for number fields / exports: 1 = <1h … 4 = 10+h
 HOURS_LABEL_TO_BAND = {value: i for i, (_, value) in enumerate(HOURS_OPTIONS, start=1)}
+
+CANONICAL_WEEKLY_HOURS_FIELD_NAMES = frozenset({
+    "weekly number of hours",
+    "hours spent this week",
+    "weekly hours",
+    "hours this week",
+    "weekly hours (band)",
+})
 
 
 def weekly_hours_band_for_label(label: str):
@@ -263,40 +271,12 @@ def weekly_hours_band_for_label(label: str):
     return HOURS_LABEL_TO_BAND.get(label)
 
 
-# --- Weekly hours ClickUp field (same list as check-in tasks: CLICKUP_LIST_ID) ---
+# --- Weekly hours ClickUp field on CHECKIN list (CLICKUP_LIST_ID) ---
 _wh_hours_field_lock = asyncio.Lock()
-_wh_hours_field_cache: dict = {"ready": False, "meta": None}  # meta = field dict from GET /list/{id}/field
-
-
-def _pick_weekly_hours_field(fields: list) -> dict | None:
-    """Choose the weekly-hours field from list definitions (no hardcoded field UUID)."""
-    if CLICKUP_WEEKLY_HOURS_FIELD_NAME:
-        for f in fields:
-            if (f.get("name") or "").strip() == CLICKUP_WEEKLY_HOURS_FIELD_NAME:
-                return f
-        print(f"[CLICKUP] CLICKUP_WEEKLY_HOURS_FIELD_NAME={CLICKUP_WEEKLY_HOURS_FIELD_NAME!r} not on list")
-    candidates = []
-    for f in fields:
-        ty = f.get("type") or ""
-        if ty not in ("number", "drop_down"):
-            continue
-        n = (f.get("name") or "").lower()
-        if "hour" not in n:
-            continue
-        if any(k in n for k in ("week", "band", "spent")):
-            candidates.append(f)
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
-        names = ", ".join((c.get("name") or "") for c in candidates)
-        print(f"[CLICKUP] Multiple weekly-hours fields ({names}) — using first. "
-              f"Set CLICKUP_WEEKLY_HOURS_FIELD_NAME to pick one.")
-        return candidates[0]
-    return None
+_wh_hours_field_cache: dict = {"ready": False, "meta": None}
 
 
 def _forced_weekly_hours_meta() -> dict | None:
-    """Optional env: known field id but no list metadata (assume number)."""
     if not CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND:
         return None
     return {
@@ -307,11 +287,45 @@ def _forced_weekly_hours_meta() -> dict | None:
     }
 
 
+def _pick_weekly_hours_field(fields: list) -> dict | None:
+    """Pick the weekly-hours field; avoids the existing numeric **Week** (calendar week) column."""
+    if CLICKUP_WEEKLY_HOURS_FIELD_NAME:
+        for f in fields:
+            if (f.get("name") or "").strip() == CLICKUP_WEEKLY_HOURS_FIELD_NAME:
+                return f
+        print(f"[CLICKUP] CLICKUP_WEEKLY_HOURS_FIELD_NAME={CLICKUP_WEEKLY_HOURS_FIELD_NAME!r} not on list")
+
+    for f in fields:
+        n = (f.get("name") or "").strip().lower()
+        if n in CANONICAL_WEEKLY_HOURS_FIELD_NAMES:
+            ty = f.get("type") or ""
+            if ty in ("number", "drop_down", "short_text", "text"):
+                return f
+
+    candidates = []
+    for f in fields:
+        ty = f.get("type") or ""
+        if ty not in ("number", "drop_down", "short_text", "text"):
+            continue
+        n = (f.get("name") or "").strip().lower()
+        if n == "week":
+            continue
+        if "hour" not in n:
+            continue
+        if any(k in n for k in ("week", "band", "spent", "number")):
+            candidates.append(f)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        names = ", ".join((c.get("name") or "") for c in candidates)
+        print(f"[CLICKUP] Multiple weekly-hours field candidates ({names}) — using first. "
+              f"Add a field named 'Weekly Number of Hours' or set CLICKUP_WEEKLY_HOURS_FIELD_NAME.")
+        return candidates[0]
+    return None
+
+
 async def get_weekly_hours_field_meta(session: aiohttp.ClientSession) -> dict | None:
-    """
-    Resolve the weekly-hours custom field on the check-in list via
-    GET /v2/list/{CLICKUP_LIST_ID}/field. Cached per process.
-    """
+    """GET /v2/list/{CLICKUP_LIST_ID}/field — cached per process."""
     forced = _forced_weekly_hours_meta()
     if forced:
         return forced
@@ -342,11 +356,10 @@ async def get_weekly_hours_field_meta(session: aiohttp.ClientSession) -> dict | 
         fields = data.get("fields") or []
         meta = _pick_weekly_hours_field(fields)
         if meta:
-            print(f"[CLICKUP] Weekly hours field on check-in list: "
-                  f"{meta.get('name')!r} id={meta.get('id')} type={meta.get('type')}")
+            print(f"[CLICKUP] Weekly hours field: {meta.get('name')!r} id={meta.get('id')} type={meta.get('type')}")
         else:
-            print("[CLICKUP] No weekly-hours custom field on check-in list — "
-                  "hours stay in description only until you add a Number or Dropdown field there.")
+            print("[CLICKUP] No weekly-hours field found — add a list field named e.g. "
+                  "'Weekly Number of Hours' (Number or Dropdown), then redeploy.")
         _wh_hours_field_cache["ready"] = True
         _wh_hours_field_cache["meta"] = meta
         return meta
@@ -363,7 +376,6 @@ def _dropdown_option_id_for_label(field_meta: dict, label: str) -> str | None:
 
 
 def _band_from_task_weekly_hours_cf(field_meta: dict, raw) -> int | None:
-    """Parse band 1–4 from a task's custom field value + list field definition."""
     if raw is None or raw == "":
         return None
     ty = field_meta.get("type") or ""
@@ -374,6 +386,18 @@ def _band_from_task_weekly_hours_cf(field_meta: dict, raw) -> int | None:
                 return n
         except (TypeError, ValueError):
             return None
+    if ty in ("short_text", "text"):
+        s = str(raw).strip()
+        b = weekly_hours_band_for_label(s)
+        if b is not None:
+            return b
+        try:
+            n = int(float(s))
+            if 1 <= n <= 4:
+                return n
+        except (TypeError, ValueError):
+            return None
+        return None
     if ty != "drop_down":
         return None
     opts = (field_meta.get("type_config") or {}).get("options") or []
@@ -393,7 +417,7 @@ def _band_from_task_weekly_hours_cf(field_meta: dict, raw) -> int | None:
 
 
 def weekly_hours_custom_field_entry(field_meta: dict | None, band: int | None, label: str) -> dict | None:
-    """Build one ClickUp custom_fields item for weekly hours, or None."""
+    """Value for create-task custom_fields."""
     if field_meta is None or band is None:
         return None
     fid = field_meta.get("id")
@@ -406,13 +430,14 @@ def weekly_hours_custom_field_entry(field_meta: dict | None, band: int | None, l
         oid = _dropdown_option_id_for_label(field_meta, label)
         if oid:
             return {"id": fid, "value": oid}
-        print(f"[CLICKUP] Dropdown weekly hours field has no option matching label {label!r}")
+        print(f"[CLICKUP] Dropdown weekly hours field has no option matching {label!r}")
         return None
+    if ty in ("short_text", "text"):
+        return {"id": fid, "value": label}
     return None
 
 
 def _weekly_hours_band_from_task(task: dict, field_meta: dict | None = None):
-    """Resolve hours band from custom field (resolved meta) or task description."""
     if field_meta and field_meta.get("id"):
         for cf in task.get("custom_fields") or []:
             if cf.get("id") != field_meta["id"]:
@@ -889,7 +914,9 @@ class StageSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         selected_stage = self.values[0]
         await interaction.response.send_message(
-            "**How many hours have you spent this week?**\nSelect from the dropdown below:",
+            "**Step 2 of 2 — Hours this week**\n"
+            "Choose roughly how many hours you’ve spent on the business this week, "
+            "then the check-in form will open.",
             view=HoursSelectView(selected_stage=selected_stage),
             ephemeral=True,
         )
@@ -909,7 +936,7 @@ class HoursSelect(discord.ui.Select):
             for label, value in HOURS_OPTIONS
         ]
         super().__init__(
-            placeholder="How many hours have you spent this week?",
+            placeholder="How many hours this week?",
             options=options,
             custom_id="hours_select",
         )
@@ -920,7 +947,7 @@ class HoursSelect(discord.ui.Select):
             CheckInModal(
                 selected_stage=self.selected_stage,
                 weekly_hours=selected_hours,
-            )
+            ),
         )
 
 
@@ -944,7 +971,8 @@ class CheckInButton(discord.ui.View):
     async def start_checkin(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = StageSelectView()
         await interaction.response.send_message(
-            "**Which stage are you currently at?**\nSelect from the dropdown below:",
+            "**Step 1 of 2 — Stage**\n"
+            "Pick the stage you’re in. **Next**, you’ll pick **hours spent this week**, then the form opens.",
             view=view,
             ephemeral=True,
         )
@@ -955,7 +983,8 @@ class CheckInButton(discord.ui.View):
 async def checkin_command(interaction: discord.Interaction):
     view = StageSelectView()
     await interaction.response.send_message(
-        "**Which stage are you currently at?**\nSelect from the dropdown below:",
+        "**Step 1 of 2 — Stage**\n"
+        "Pick the stage you’re in. **Next**, you’ll pick **hours spent this week**, then the form opens.",
         view=view,
         ephemeral=True,
     )
