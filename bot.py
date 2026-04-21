@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import random
@@ -19,6 +20,10 @@ CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
 CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
 CLICKUP_MEMBER_DB_LIST_ID = "901516122313"
 EXPORT_WEBHOOK_URL = os.getenv("EXPORT_WEBHOOK_URL", "")
+# Optional: Number custom field on the *check-in* list — store band 1–4 (see HOURS_LABEL_TO_BAND).
+CI_FIELD_WEEKLY_HOURS_BAND = (os.getenv("CLICKUP_CI_FIELD_WEEKLY_HOURS_BAND") or "").strip()
+# Optional: POST JSON on each successful check-in (e.g. Make.com → Google Sheets append row).
+CHECKIN_SHEETS_WEBHOOK_URL = (os.getenv("CHECKIN_SHEETS_WEBHOOK_URL") or "").strip()
 
 # --- Validate required env vars at import time ---
 _missing = [k for k, v in {
@@ -248,6 +253,52 @@ HOURS_OPTIONS = [
     ("Five to ten hours", "Five to ten hours"),
     ("10+ hours", "10+ hours"),
 ]
+
+# Band sent to ClickUp / Sheets: 1 = <1h, 2 = 2–4h, 3 = 5–10h, 4 = 10+h
+HOURS_LABEL_TO_BAND = {value: i for i, (_, value) in enumerate(HOURS_OPTIONS, start=1)}
+
+
+def weekly_hours_band_for_label(label: str):
+    """Return 1–4 for a known hours label, else None."""
+    return HOURS_LABEL_TO_BAND.get(label)
+
+
+def _weekly_hours_band_from_task(task: dict):
+    """Resolve hours band from custom field (if configured) or task description."""
+    if CI_FIELD_WEEKLY_HOURS_BAND:
+        for cf in task.get("custom_fields") or []:
+            if cf.get("id") != CI_FIELD_WEEKLY_HOURS_BAND:
+                continue
+            raw = cf.get("value")
+            if raw is None or raw == "":
+                break
+            try:
+                return int(float(raw))
+            except (TypeError, ValueError):
+                break
+    desc = task.get("description") or ""
+    m = re.search(r"\*\*Hours Spent This Week:\*\*\s*(.+?)(?:\n|$)", desc, re.IGNORECASE)
+    if m:
+        return weekly_hours_band_for_label(m.group(1).strip())
+    return None
+
+
+async def _post_checkin_sheets_webhook(payload: dict):
+    """Fire-and-forget row sync for Google Sheets (or any HTTP receiver)."""
+    if not CHECKIN_SHEETS_WEBHOOK_URL:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                CHECKIN_SHEETS_WEBHOOK_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status >= 300:
+                    body = await resp.text()
+                    print(f"[SHEETS] Webhook returned {resp.status}: {body[:400]}")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"[SHEETS] Webhook error: {e}")
 
 
 # --- Weekly check-in tracking ---
@@ -490,10 +541,25 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
     async def on_submit(self, interaction: discord.Interaction):
         # Build ClickUp task
         today = datetime.now().strftime("%b %d, %Y")
+        hours_band = weekly_hours_band_for_label(self.weekly_hours)
         headers = {
             "Authorization": CLICKUP_TOKEN,
             "Content-Type": "application/json",
         }
+        custom_fields = [
+            {"id": CI_FIELD_MEMBER, "value": interaction.user.display_name},
+            {"id": CI_FIELD_DATE, "value": today},
+            {"id": CI_FIELD_STAGE, "value": self.selected_stage},
+            {"id": CI_FIELD_WEEKS_IN_STAGE, "value": self.weeks.value},
+            {"id": CI_FIELD_WEEK, "value": datetime.now().isocalendar()[1]},
+            {"id": CI_FIELD_BLOCKER, "value": self.blocker.value},
+            {"id": CI_FIELD_WHAT_WOULD_HELP, "value": self.help_needed.value},
+            {"id": CI_FIELD_NEXT_STEPS, "value": self.next_steps.value},
+        ]
+        if CI_FIELD_WEEKLY_HOURS_BAND and hours_band is not None:
+            custom_fields.append(
+                {"id": CI_FIELD_WEEKLY_HOURS_BAND, "value": hours_band},
+            )
         task_data = {
             "name": f"Check-in — {interaction.user.display_name} — {today}",
             "description": (
@@ -510,16 +576,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
             ),
             "priority": 3,
             "tags": ["check-in", interaction.user.name],
-            "custom_fields": [
-                {"id": CI_FIELD_MEMBER, "value": interaction.user.display_name},
-                {"id": CI_FIELD_DATE, "value": today},
-                {"id": CI_FIELD_STAGE, "value": self.selected_stage},
-                {"id": CI_FIELD_WEEKS_IN_STAGE, "value": self.weeks.value},
-                {"id": CI_FIELD_WEEK, "value": datetime.now().isocalendar()[1]},
-                {"id": CI_FIELD_BLOCKER, "value": self.blocker.value},
-                {"id": CI_FIELD_WHAT_WOULD_HELP, "value": self.help_needed.value},
-                {"id": CI_FIELD_NEXT_STEPS, "value": self.next_steps.value},
-            ],
+            "custom_fields": custom_fields,
         }
 
         # Respond to Discord immediately (must be within 3 seconds)
@@ -554,6 +611,20 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                     ephemeral=True,
                 )
                 print(f"[OK] Check-in from {interaction.user.display_name}")
+
+                _et = ZoneInfo("America/New_York")
+                asyncio.create_task(_post_checkin_sheets_webhook({
+                    "event": "checkin_submitted",
+                    "clickup_task_id": checkin_task_id,
+                    "discord_user_id": str(interaction.user.id),
+                    "discord_username": interaction.user.name,
+                    "display_name": interaction.user.display_name,
+                    "date": today,
+                    "stage": self.selected_stage,
+                    "weekly_hours_band": hours_band,
+                    "weekly_hours_label": self.weekly_hours,
+                    "iso_week": datetime.now(_et).isocalendar()[1],
+                }))
 
                 # Update member profile + enrich check-in task in background
                 asyncio.create_task(_update_member_after_checkin(
@@ -1238,6 +1309,7 @@ async def monthly_export():
                 "created_at": t.get("date_created"),
                 "description": t.get("description", ""),
                 "tags": [tag.get("name") for tag in t.get("tags", [])],
+                "weekly_hours_band": _weekly_hours_band_from_task(t),
             }
             for t in all_tasks
         ],
