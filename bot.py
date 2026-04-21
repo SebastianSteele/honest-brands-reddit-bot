@@ -242,6 +242,13 @@ STAGE_OPTIONS = [
     ("5. Scaling", "5. Scaling"),
 ]
 
+HOURS_OPTIONS = [
+    ("Less than an hour", "Less than an hour"),
+    ("Two to four hours", "Two to four hours"),
+    ("Five to ten hours", "Five to ten hours"),
+    ("10+ hours", "10+ hours"),
+]
+
 
 # --- Weekly check-in tracking ---
 def _get_week_start():
@@ -450,9 +457,10 @@ async def update_member_profile(task_id: str, stage: str,
 
 # --- Check-in Modal (the popup form) ---
 class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
-    def __init__(self, selected_stage: str):
+    def __init__(self, selected_stage: str, weekly_hours: str):
         super().__init__()
         self.selected_stage = selected_stage
+        self.weekly_hours = weekly_hours
 
     weeks = discord.ui.TextInput(
         label="How many weeks have you been in this stage?",
@@ -494,6 +502,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                 f"**Date:** {today}\n\n"
                 f"---\n\n"
                 f"**Stage:** {self.selected_stage}\n\n"
+                f"**Hours Spent This Week:** {self.weekly_hours}\n\n"
                 f"**Weeks in Stage:** {self.weeks.value}\n\n"
                 f"**Blocker:** {self.blocker.value}\n\n"
                 f"**What Would Help:** {self.help_needed.value}\n\n"
@@ -692,13 +701,46 @@ class StageSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         selected_stage = self.values[0]
-        await interaction.response.send_modal(CheckInModal(selected_stage=selected_stage))
+        await interaction.response.send_message(
+            "**How many hours have you spent this week?**\nSelect from the dropdown below:",
+            view=HoursSelectView(selected_stage=selected_stage),
+            ephemeral=True,
+        )
 
 
 class StageSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
         self.add_item(StageSelect())
+
+
+class HoursSelect(discord.ui.Select):
+    def __init__(self, selected_stage: str):
+        self.selected_stage = selected_stage
+        options = [
+            discord.SelectOption(label=label, value=value)
+            for label, value in HOURS_OPTIONS
+        ]
+        super().__init__(
+            placeholder="How many hours have you spent this week?",
+            options=options,
+            custom_id="hours_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_hours = self.values[0]
+        await interaction.response.send_modal(
+            CheckInModal(
+                selected_stage=self.selected_stage,
+                weekly_hours=selected_hours,
+            )
+        )
+
+
+class HoursSelectView(discord.ui.View):
+    def __init__(self, selected_stage: str):
+        super().__init__(timeout=300)
+        self.add_item(HoursSelect(selected_stage=selected_stage))
 
 
 # --- Button that opens the stage select ---
