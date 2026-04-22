@@ -752,23 +752,77 @@ def _pick_ticket_channel_for_confirmation(channels: list[discord.TextChannel]) -
     return max(pool, key=ticket_prefix)
 
 
-def _resolve_coach_mentions(guild: discord.Guild, coach_clickup_names: list[str]) -> str:
-    """Match ClickUp Coach display names to guild members; return space-separated Discord mentions."""
-    if not coach_clickup_names:
+def _coach_assignee_labels(member_task: dict) -> list[str]:
+    """Coach custom field + ClickUp task assignees (CSM often appears as assignee)."""
+    labels: list[str] = []
+    seen: set[str] = set()
+
+    _, coaches = _extract_member_info(member_task)
+    for c in coaches:
+        s = (c or "").strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            labels.append(s)
+
+    if os.getenv("CHECKIN_TAG_ASSIGNEES", "true").lower() not in ("0", "false", "no", "off"):
+        for a in member_task.get("assignees") or []:
+            name = (a.get("username") or "").strip()
+            if name and name.lower() not in seen:
+                seen.add(name.lower())
+                labels.append(name)
+
+    return labels
+
+
+def _score_name_match(member: discord.Member, label_low: str, tokens: list[str]) -> int:
+    """Higher = better match for fuzzy coach resolution."""
+    if member.bot:
+        return -1
+    dn = (member.display_name or "").lower()
+    gn = (getattr(member, "global_name", None) or "").lower()
+    un = member.name.lower()
+    surfaces = [dn, gn, un, f"{dn} {gn}".strip(), f"{gn} {dn}".strip()]
+    best = 0
+    for s in surfaces:
+        if not s:
+            continue
+        if s == label_low:
+            best = max(best, 100)
+        elif label_low in s or s in label_low:
+            best = max(best, 80)
+        elif all(t in s for t in tokens):
+            best = max(best, 60)
+        elif tokens and tokens[0] in s:
+            best = max(best, 40)
+    return best
+
+
+async def _resolve_coach_mentions_async(guild: discord.Guild, coach_labels: list[str]) -> str:
+    """Match ClickUp names to guild members (cache + gateway query_members + fuzzy scoring)."""
+    if not coach_labels:
         return ""
 
-    seen: set[int] = set()
+    seen_ids: set[int] = set()
     mentions: list[str] = []
 
-    for raw in coach_clickup_names:
+    for raw in coach_labels:
         label = (raw or "").strip()
         if not label:
             continue
 
+        label_low = label.lower()
+        tokens = [t for t in label_low.split() if t]
+
         member = guild.get_member_named(label)
 
         if member is None:
-            low = label.lower()
+            for m in guild.members:
+                if _score_name_match(m, label_low, tokens) >= 100:
+                    member = m
+                    break
+
+        if member is None:
+            low = label_low
             for m in guild.members:
                 if m.bot:
                     continue
@@ -778,15 +832,42 @@ def _resolve_coach_mentions(guild: discord.Guild, coach_clickup_names: list[str]
                     member = m
                     break
 
-        if member is None:
-            parts = label.split()
-            if len(parts) >= 2:
-                member = guild.get_member_named(f"{parts[0]} {parts[-1]}")
-                if member is None:
-                    member = guild.get_member_named(parts[0])
+        if member is None and len(tokens) >= 2:
+            member = guild.get_member_named(f"{tokens[0]} {tokens[-1]}".title())
+            if member is None:
+                member = guild.get_member_named(tokens[0])
 
-        if member is not None and member.id not in seen:
-            seen.add(member.id)
+        if member is None and tokens:
+            q = tokens[0][:31]
+            try:
+                queried = await guild.query_members(query=q, limit=30)
+            except (discord.HTTPException, TypeError, ValueError) as e:
+                print(f"[TICKET] query_members({q!r}): {e}")
+                queried = []
+
+            best_m = None
+            best_score = 0
+            for m in queried:
+                sc = _score_name_match(m, label_low, tokens)
+                if sc > best_score:
+                    best_score = sc
+                    best_m = m
+            if best_m is not None and best_score >= 40:
+                member = best_m
+
+        if member is None and tokens:
+            best_m = None
+            best_score = 0
+            for m in guild.members:
+                sc = _score_name_match(m, label_low, tokens)
+                if sc > best_score:
+                    best_score = sc
+                    best_m = m
+            if best_m is not None and best_score >= 60:
+                member = best_m
+
+        if member is not None and member.id not in seen_ids:
+            seen_ids.add(member.id)
             mentions.append(member.mention)
         else:
             print(f"[TICKET] Could not resolve coach/CSM to Discord member: {label!r}")
@@ -826,8 +907,8 @@ async def post_public_checkin_confirmation(client: discord.Client, user: discord
         coach_ping = ""
         member_task = await find_member_by_discord(user.name)
         if member_task:
-            _, coach_names = _extract_member_info(member_task)
-            coach_ping = _resolve_coach_mentions(guild, coach_names)
+            labels = _coach_assignee_labels(member_task)
+            coach_ping = await _resolve_coach_mentions_async(guild, labels)
 
         body = f"{user.mention} **Check-in received** — thanks! Your weekly update was logged."
         if coach_ping:
