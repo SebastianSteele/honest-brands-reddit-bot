@@ -720,6 +720,76 @@ async def update_member_profile(task_id: str, stage: str,
         print(f"[CLICKUP] Updated member profile: {task_id}")
 
 
+# --- Public check-in confirmation in 1-1 ticket channels ---
+# Channel names follow "<ticket#>-<discord_username>", e.g. "69-michaelralston92".
+_TICKET_CHANNEL_NAME_RE = re.compile(r"^(\d+)-(.+)$")
+
+
+def _ticket_channels_for_username(guild: discord.Guild, username_lower: str) -> list[discord.TextChannel]:
+    found = []
+    for ch in guild.text_channels:
+        m = _TICKET_CHANNEL_NAME_RE.match(ch.name.strip())
+        if m and m.group(2).lower() == username_lower:
+            found.append(ch)
+    return found
+
+
+def _pick_ticket_channel_for_confirmation(channels: list[discord.TextChannel]) -> discord.TextChannel | None:
+    """Prefer a channel not under a 'Closed' category; if multiple, prefer highest ticket prefix."""
+    if not channels:
+        return None
+
+    def ticket_prefix(ch: discord.TextChannel) -> int:
+        m = _TICKET_CHANNEL_NAME_RE.match(ch.name.strip())
+        return int(m.group(1)) if m else 0
+
+    def is_closed_category(ch: discord.TextChannel) -> bool:
+        cat = ch.category.name if ch.category else ""
+        return "closed" in cat.lower()
+
+    open_like = [c for c in channels if not is_closed_category(c)]
+    pool = open_like if open_like else channels
+    return max(pool, key=ticket_prefix)
+
+
+async def post_public_checkin_confirmation(client: discord.Client, user: discord.User) -> None:
+    """Post a short, non-sensitive confirmation in the member's 1-1 ticket channel (visible to everyone there)."""
+    flag = os.getenv("CHECKIN_TICKET_CONFIRM", "true").lower()
+    if flag in ("0", "false", "no", "off"):
+        return
+
+    guild_id_raw = (os.getenv("DISCORD_GUILD_ID") or "").strip()
+    try:
+        if guild_id_raw:
+            guild = client.get_guild(int(guild_id_raw))
+        elif len(client.guilds) == 1:
+            guild = client.guilds[0]
+        else:
+            print("[TICKET] Multiple guilds connected — set DISCORD_GUILD_ID for ticket confirmations.")
+            return
+
+        if guild is None:
+            print("[TICKET] Guild not found for ticket confirmation.")
+            return
+
+        candidates = _ticket_channels_for_username(guild, user.name.lower())
+        channel = _pick_ticket_channel_for_confirmation(candidates)
+        if channel is None:
+            print(f"[TICKET] No ticket channel matching username {user.name!r}")
+            return
+
+        await channel.send(
+            f"{user.mention} **Check-in received** — thanks! Your weekly update was logged."
+        )
+        print(f"[TICKET] Posted confirmation in #{channel.name}")
+    except discord.Forbidden:
+        print(f"[TICKET] Missing permission to post in ticket channel for {user.name!r}")
+    except discord.HTTPException as e:
+        print(f"[TICKET] Discord HTTP error posting confirmation: {e}")
+    except Exception as e:
+        print(f"[TICKET] Error posting confirmation: {e}")
+
+
 # --- Check-in Modal (the popup form) ---
 class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
     def __init__(self, selected_stage: str, weekly_hours: str):
@@ -839,6 +909,11 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                     help_needed=self.help_needed.value,
                     next_steps=self.next_steps.value,
                     checkin_task_id=checkin_task_id,
+                ))
+                # Short public note in their 1-1 ticket channel (no form details)
+                asyncio.create_task(post_public_checkin_confirmation(
+                    interaction.client,
+                    interaction.user,
                 ))
             else:
                 await interaction.followup.send(

@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-import requests, re
+import os
+import re
+from pathlib import Path
 
-TOKEN = "pk_106691179_ZE5E83KN5B2J3Q0KZ2Z66RCOOKR9HD3Z"
-LIST_ID = "901522659802"
+import requests
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+TOKEN = (os.getenv("CLICKUP_TOKEN") or "").strip()
+LIST_ID = (os.getenv("CLICKUP_LIST_ID") or "").strip()
+if not TOKEN or not LIST_ID:
+    raise SystemExit("Set CLICKUP_TOKEN and CLICKUP_LIST_ID in .env")
 HEADERS = {"Authorization": TOKEN}
 
 tasks = []
