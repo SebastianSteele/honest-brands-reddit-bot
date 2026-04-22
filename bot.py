@@ -752,8 +752,53 @@ def _pick_ticket_channel_for_confirmation(channels: list[discord.TextChannel]) -
     return max(pool, key=ticket_prefix)
 
 
+def _resolve_coach_mentions(guild: discord.Guild, coach_clickup_names: list[str]) -> str:
+    """Match ClickUp Coach display names to guild members; return space-separated Discord mentions."""
+    if not coach_clickup_names:
+        return ""
+
+    seen: set[int] = set()
+    mentions: list[str] = []
+
+    for raw in coach_clickup_names:
+        label = (raw or "").strip()
+        if not label:
+            continue
+
+        member = guild.get_member_named(label)
+
+        if member is None:
+            low = label.lower()
+            for m in guild.members:
+                if m.bot:
+                    continue
+                dn = (m.display_name or "").lower()
+                gn = (getattr(m, "global_name", None) or "").lower()
+                if m.name.lower() == low or dn == low or gn == low:
+                    member = m
+                    break
+
+        if member is None:
+            parts = label.split()
+            if len(parts) >= 2:
+                member = guild.get_member_named(f"{parts[0]} {parts[-1]}")
+                if member is None:
+                    member = guild.get_member_named(parts[0])
+
+        if member is not None and member.id not in seen:
+            seen.add(member.id)
+            mentions.append(member.mention)
+        else:
+            print(f"[TICKET] Could not resolve coach/CSM to Discord member: {label!r}")
+
+    return " ".join(mentions)
+
+
 async def post_public_checkin_confirmation(client: discord.Client, user: discord.User) -> None:
-    """Post a short, non-sensitive confirmation in the member's 1-1 ticket channel (visible to everyone there)."""
+    """Post a short, non-sensitive confirmation in the member's 1-1 ticket channel (visible to everyone there).
+
+    Tags coaches from the ClickUp Member Database Coach field when they match a member of the guild (CSM ping).
+    """
     flag = os.getenv("CHECKIN_TICKET_CONFIRM", "true").lower()
     if flag in ("0", "false", "no", "off"):
         return
@@ -778,9 +823,17 @@ async def post_public_checkin_confirmation(client: discord.Client, user: discord
             print(f"[TICKET] No ticket channel matching username {user.name!r}")
             return
 
-        await channel.send(
-            f"{user.mention} **Check-in received** — thanks! Your weekly update was logged."
-        )
+        coach_ping = ""
+        member_task = await find_member_by_discord(user.name)
+        if member_task:
+            _, coach_names = _extract_member_info(member_task)
+            coach_ping = _resolve_coach_mentions(guild, coach_names)
+
+        body = f"{user.mention} **Check-in received** — thanks! Your weekly update was logged."
+        if coach_ping:
+            body = f"{coach_ping}\n{body}"
+
+        await channel.send(body)
         print(f"[TICKET] Posted confirmation in #{channel.name}")
     except discord.Forbidden:
         print(f"[TICKET] Missing permission to post in ticket channel for {user.name!r}")
