@@ -1103,7 +1103,11 @@ def _extract_member_info(member_task):
 async def _enrich_checkin_task(checkin_task_id, member_task, discord_username):
     """Add program, coach, and Discord username tags + update description on a check-in task."""
     headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
-    program, coaches = _extract_member_info(member_task)
+    program, _ = _extract_member_info(member_task)
+    # Use _coach_assignee_labels to pull coaches from BOTH the Coach custom
+    # field AND the task assignees so members without the Coach field still
+    # get their CSM/coach tagged on the check-in task.
+    coaches = _coach_assignee_labels(member_task)
 
     # Build tags to add
     tags = []
