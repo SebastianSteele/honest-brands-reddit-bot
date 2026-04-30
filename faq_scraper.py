@@ -35,8 +35,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -45,7 +45,15 @@ import aiohttp
 import discord
 from discord.ext import tasks
 
-log = logging.getLogger("hai.faq_scraper")
+
+# Use print() with a [HAI] prefix for Railway visibility — matches the
+# rest of the bot's logging conventions ([SYNC], [CLICKUP], [SCAN], ...).
+# Python's `logging` module is configured at WARNING by default in this
+# project, which silenced our earlier log.info() calls.
+def _log(msg: str) -> None:
+    print(f"[HAI] {msg}", flush=True)
+    sys.stdout.flush()
+
 
 DEFAULT_CHANNEL_ID = "1402210105960693810"
 DEFAULT_STATE_FILENAME = "faq_scraper_state.json"
@@ -59,7 +67,16 @@ def _cfg() -> dict[str, Any]:
         "webhook_url": os.getenv("HAI_WEBHOOK_URL", "").strip(),
         "webhook_secret": os.getenv("HAI_WEBHOOK_SECRET", "").strip(),
         "scrape_hour_utc": int(os.getenv("HAI_SCRAPE_HOUR_UTC", "12")),
-        "max_messages": int(os.getenv("HAI_MAX_MESSAGES", "2000")),
+        # Default capped at 500 messages per run. All-time backfill
+        # completes over multiple days' daily runs — this keeps any
+        # single run fast enough to live inside Discord's rate-limit
+        # budgets without thrashing.
+        "max_messages": int(os.getenv("HAI_MAX_MESSAGES", "500")),
+        # Sibling-scan reads the next 30 messages after every non-threaded
+        # question to find inline answers. It's accurate but blows the
+        # API-call budget up by ~30x. Off by default; turn on only once
+        # the initial backfill has completed.
+        "sibling_scan": os.getenv("HAI_SIBLING_SCAN", "false").lower() in ("1", "true", "yes", "on"),
         "state_path": Path(os.getenv("HAI_STATE_PATH", DEFAULT_STATE_FILENAME)),
     }
 
@@ -71,7 +88,7 @@ def _load_state(path: Path) -> dict[str, Any]:
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
-        log.warning("state load failed (%s) — starting fresh", e)
+        _log(f"state load failed ({e}) — starting fresh")
     return {}
 
 
@@ -79,7 +96,7 @@ def _save_state(path: Path, state: dict[str, Any]) -> None:
     try:
         path.write_text(json.dumps(state, indent=2), encoding="utf-8")
     except Exception as e:
-        log.error("state save failed: %s", e)
+        _log(f"state save failed: {e}")
 
 
 # ---------- message shaping ----------
@@ -99,14 +116,20 @@ def _reply_count(m: discord.Message) -> int:
     return 0
 
 
-async def _extract_best_answer(msg: discord.Message) -> dict[str, Any] | None:
+async def _extract_best_answer(
+    msg: discord.Message, enable_sibling_scan: bool
+) -> dict[str, Any] | None:
     """
     Pick the "best answer" for a question:
       1. If the message has a thread, scan first 50 thread messages and
          pick the non-author / non-bot reply with highest reaction count.
-      2. Else scan the next 30 sibling messages; prefer a direct reply
-         to this message with reactions; else first non-author reply
-         with >= 20 chars.
+      2. Else (and sibling-scan is enabled), scan the next 30 sibling
+         messages; prefer a direct reply with reactions; else first
+         non-author reply with >= 20 chars.
+
+    Sibling-scan is expensive (30x API calls per question) so it's
+    gated behind HAI_SIBLING_SCAN to keep first-backfill runs within
+    Discord's rate-limit budget.
     """
     asker_id = msg.author.id
     thread = getattr(msg, "thread", None)
@@ -136,34 +159,35 @@ async def _extract_best_answer(msg: discord.Message) -> dict[str, Any] | None:
                     "created_at": int(best.created_at.timestamp() * 1000),
                 }
 
-        # Sibling scan
-        best: discord.Message | None = None
-        best_score = -1
-        async for m in msg.channel.history(
-            limit=30, after=discord.Object(id=msg.id), oldest_first=True
-        ):
-            if m.author.bot or m.author.id == asker_id:
-                continue
-            content = (m.content or "").strip()
-            if not content:
-                continue
-            score = _reaction_count(m)
-            ref = getattr(m, "reference", None)
-            if ref is not None and getattr(ref, "message_id", None) == msg.id:
-                score += 100
-            if score > best_score and len(content) >= 20:
-                best = m
-                best_score = score
-        if best is not None:
-            return {
-                "content": (best.content or "")[:4000],
-                "author_name": _display_name(best.author),
-                "created_at": int(best.created_at.timestamp() * 1000),
-            }
+        # Sibling scan — opt-in only (30 API calls per question).
+        if enable_sibling_scan:
+            best: discord.Message | None = None
+            best_score = -1
+            async for m in msg.channel.history(
+                limit=30, after=discord.Object(id=msg.id), oldest_first=True
+            ):
+                if m.author.bot or m.author.id == asker_id:
+                    continue
+                content = (m.content or "").strip()
+                if not content:
+                    continue
+                score = _reaction_count(m)
+                ref = getattr(m, "reference", None)
+                if ref is not None and getattr(ref, "message_id", None) == msg.id:
+                    score += 100
+                if score > best_score and len(content) >= 20:
+                    best = m
+                    best_score = score
+            if best is not None:
+                return {
+                    "content": (best.content or "")[:4000],
+                    "author_name": _display_name(best.author),
+                    "created_at": int(best.created_at.timestamp() * 1000),
+                }
     except discord.Forbidden:
-        log.warning("permissions denied reading message %s", msg.id)
+        _log(f"permissions denied reading message {msg.id}")
     except Exception as e:
-        log.warning("best-answer extraction failed for %s: %s", msg.id, e)
+        _log(f"best-answer extraction failed for {msg.id}: {e}")
 
     return None
 
@@ -212,7 +236,7 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
     cfg = _cfg()
     if not cfg["webhook_url"] or not cfg["webhook_secret"]:
         msg = "HAI_WEBHOOK_URL / HAI_WEBHOOK_SECRET not configured — skipping"
-        log.warning(msg)
+        _log(msg)
         return {"ok": False, "error": msg}
 
     channel = client.get_channel(cfg["channel_id"])
@@ -221,7 +245,7 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
             channel = await client.fetch_channel(cfg["channel_id"])
         except Exception as e:
             msg = f"cannot resolve channel {cfg['channel_id']}: {e}"
-            log.error(msg)
+            _log(msg)
             return {"ok": False, "error": msg}
 
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
@@ -229,16 +253,17 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
             f"channel {cfg['channel_id']} is type "
             f"{type(channel).__name__} — expected TextChannel/Thread"
         )
-        log.error(msg)
+        _log(msg)
         return {"ok": False, "error": msg}
 
     state = _load_state(cfg["state_path"])
     after_id: str | None = state.get("last_message_id")
     guild_id = str(channel.guild.id) if getattr(channel, "guild", None) else ""
 
-    log.info(
-        "FAQ scrape: channel=#%s (%s) guild=%s after=%s max=%d",
-        channel.name, cfg["channel_id"], guild_id, after_id, cfg["max_messages"],
+    _log(
+        f"scrape start: channel=#{channel.name} ({cfg['channel_id']}) "
+        f"guild={guild_id} after={after_id} max={cfg['max_messages']} "
+        f"sibling_scan={cfg['sibling_scan']}"
     )
 
     collected: list[dict[str, Any]] = []
@@ -246,6 +271,7 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
     after_obj = discord.Object(id=int(after_id)) if after_id else None
     count = 0
     errored = 0
+    progress_every = max(50, cfg["max_messages"] // 10)
     async for m in channel.history(
         limit=None, after=after_obj, oldest_first=True
     ):
@@ -253,6 +279,8 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
         count += 1
         if count > cfg["max_messages"]:
             break
+        if count % progress_every == 0:
+            _log(f"  walked {count} messages, collected {len(collected)} questions so far...")
         if m.author.bot:
             continue
         content = (m.content or "").strip()
@@ -260,7 +288,7 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
             continue
 
         try:
-            answer = await _extract_best_answer(m)
+            answer = await _extract_best_answer(m, cfg["sibling_scan"])
             thread_obj = getattr(m, "thread", None)
 
             collected.append({
@@ -279,13 +307,13 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
             # scrape. Common culprits: forum-starter messages with odd
             # shapes, deleted referenced_message, transient API quirks.
             errored += 1
-            log.warning("failed to process message %s: %s", getattr(m, "id", "?"), ex)
+            _log(f"  failed to process message {getattr(m, 'id', '?')}: {ex}")
             continue
 
     if errored:
-        log.info("scrape skipped %d problematic messages (see warnings above)", errored)
+        _log(f"skipped {errored} problematic messages")
 
-    log.info("collected %d new questions", len(collected))
+    _log(f"collected {len(collected)} new questions from {count} walked messages")
 
     if not collected:
         if newest_id and newest_id != after_id:
@@ -303,19 +331,19 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
                 cfg["channel_id"], guild_id, chunk,
             )
             if not ok:
-                log.error("FAQ POST failed chunk %d-%d: %s",
-                          i, i + len(chunk) - 1, info)
+                _log(f"POST failed chunk {i}-{i + len(chunk) - 1}: {info}")
                 # Rewind watermark so next run retries from this chunk
                 state["last_message_id"] = chunk[0]["id"]
                 _save_state(cfg["state_path"], state)
                 return {"ok": False, "shipped": shipped, "error": info}
             shipped += len(chunk)
-            log.info("shipped chunk %d-%d (%s)", i, i + len(chunk) - 1, info)
+            _log(f"shipped chunk {i}-{i + len(chunk) - 1} ({info})")
 
     if newest_id:
         state["last_message_id"] = newest_id
         _save_state(cfg["state_path"], state)
 
+    _log(f"scrape done: scanned={len(collected)} shipped={shipped} watermark={newest_id}")
     return {"ok": True, "scanned": len(collected), "shipped": shipped, "watermark": newest_id}
 
 
@@ -336,8 +364,9 @@ def register(client: discord.Client) -> None:
     async def _daily():
         try:
             await run_once(client)
-        except Exception:
-            log.exception("FAQ daily scrape errored")
+        except Exception as e:
+            import traceback
+            _log(f"daily scrape errored: {e}\n{traceback.format_exc()}")
 
     @_daily.before_loop
     async def _before():
@@ -350,11 +379,8 @@ def register(client: discord.Client) -> None:
         if target <= now:
             target = target + timedelta(days=1)
         sleep_s = max(60, int((target - now).total_seconds()))
-        log.info(
-            "FAQ scraper: sleeping %ds until first run at %s UTC",
-            sleep_s, target.isoformat(),
-        )
+        _log(f"scraper sleeping {sleep_s}s until first run at {target.isoformat()} UTC")
         await asyncio.sleep(sleep_s)
 
     _daily.start()
-    log.info("FAQ daily scrape task registered (runs every 24h)")
+    _log("daily scrape task registered (runs every 24h)")
