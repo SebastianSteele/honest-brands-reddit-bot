@@ -1332,6 +1332,66 @@ async def checkin_status(interaction: discord.Interaction):
     await interaction.followup.send(msg, ephemeral=True)
 
 
+@tree.command(
+    name="hai_scrape_now",
+    description="[Admin] Force-run the HonestAI FAQ scrape right now",
+)
+@app_commands.default_permissions(administrator=True)
+async def hai_scrape_now(interaction: discord.Interaction):
+    """Kicks off a one-shot scrape of #ask-honestai and ships it to the
+    Apps Script Web App. Replies ephemerally with a short summary.
+    """
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        import faq_scraper
+    except Exception as e:
+        await interaction.followup.send(
+            f"⚠️ FAQ scraper module not available: {e}",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        result = await faq_scraper.run_once(client)
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Scrape errored: `{e}`",
+            ephemeral=True,
+        )
+        return
+
+    if not result or not result.get("ok"):
+        err = (result or {}).get("error", "unknown error")
+        await interaction.followup.send(
+            f"❌ Scrape failed: `{err}`",
+            ephemeral=True,
+        )
+        return
+
+    scanned = result.get("scanned", 0)
+    shipped = result.get("shipped", 0)
+    watermark = result.get("watermark") or "(unchanged)"
+
+    if scanned == 0:
+        body = (
+            "✅ Scrape finished — no new messages since last run.\n"
+            f"Watermark: `{watermark}`\n\n"
+            "Run **HonestAI FAQ → Run analysis now** in the sheet to classify "
+            "anything pending."
+        )
+    else:
+        body = (
+            f"✅ Scrape finished\n"
+            f"• scanned: **{scanned}** new questions\n"
+            f"• shipped: **{shipped}** to Apps Script\n"
+            f"• watermark: `{watermark}`\n\n"
+            "Next: **HonestAI FAQ → Run analysis now** in the sheet to "
+            "classify + render the dashboard."
+        )
+    await interaction.followup.send(body, ephemeral=True)
+
+
 # --- Periodic scan: detect new Accelerate members from ClickUp ---
 @tasks.loop(hours=6)
 async def scan_new_accelerate_members():
