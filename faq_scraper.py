@@ -93,8 +93,9 @@ def _reaction_count(m: discord.Message) -> int:
 
 
 def _reply_count(m: discord.Message) -> int:
-    if m.thread is not None and m.thread.message_count is not None:
-        return int(m.thread.message_count)
+    thread = getattr(m, "thread", None)
+    if thread is not None and getattr(thread, "message_count", None) is not None:
+        return int(thread.message_count)
     return 0
 
 
@@ -108,11 +109,12 @@ async def _extract_best_answer(msg: discord.Message) -> dict[str, Any] | None:
          with >= 20 chars.
     """
     asker_id = msg.author.id
+    thread = getattr(msg, "thread", None)
 
     try:
-        if msg.thread is not None:
+        if thread is not None:
             candidates: list[discord.Message] = []
-            async for t in msg.thread.history(limit=50, oldest_first=True):
+            async for t in thread.history(limit=50, oldest_first=True):
                 if t.author.bot or t.author.id == asker_id:
                     continue
                 if not (t.content or "").strip():
@@ -120,7 +122,7 @@ async def _extract_best_answer(msg: discord.Message) -> dict[str, Any] | None:
                 candidates.append(t)
             # Fall back to asker follow-ups only if nobody else posted
             if not candidates:
-                async for t in msg.thread.history(limit=50, oldest_first=True):
+                async for t in thread.history(limit=50, oldest_first=True):
                     if not t.author.bot and (t.content or "").strip():
                         candidates.append(t)
             if candidates:
@@ -243,6 +245,7 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
     newest_id: str | None = after_id
     after_obj = discord.Object(id=int(after_id)) if after_id else None
     count = 0
+    errored = 0
     async for m in channel.history(
         limit=None, after=after_obj, oldest_first=True
     ):
@@ -256,19 +259,31 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
         if not content:
             continue
 
-        answer = await _extract_best_answer(m)
+        try:
+            answer = await _extract_best_answer(m)
+            thread_obj = getattr(m, "thread", None)
 
-        collected.append({
-            "id": str(m.id),
-            "thread_id": str(m.thread.id) if m.thread is not None else None,
-            "author_id": str(m.author.id),
-            "author_name": _display_name(m.author),
-            "content": content[:4000],
-            "created_at": int(m.created_at.timestamp() * 1000),
-            "reply_count": _reply_count(m),
-            "reaction_count": _reaction_count(m),
-            "answer": answer,
-        })
+            collected.append({
+                "id": str(m.id),
+                "thread_id": str(thread_obj.id) if thread_obj is not None else None,
+                "author_id": str(m.author.id),
+                "author_name": _display_name(m.author),
+                "content": content[:4000],
+                "created_at": int(m.created_at.timestamp() * 1000),
+                "reply_count": _reply_count(m),
+                "reaction_count": _reaction_count(m),
+                "answer": answer,
+            })
+        except Exception as ex:
+            # Log + skip — one bad message should never abort the whole
+            # scrape. Common culprits: forum-starter messages with odd
+            # shapes, deleted referenced_message, transient API quirks.
+            errored += 1
+            log.warning("failed to process message %s: %s", getattr(m, "id", "?"), ex)
+            continue
+
+    if errored:
+        log.info("scrape skipped %d problematic messages (see warnings above)", errored)
 
     log.info("collected %d new questions", len(collected))
 
