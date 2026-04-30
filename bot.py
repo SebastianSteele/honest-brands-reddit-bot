@@ -1824,5 +1824,15 @@ async def on_ready():
             monthly_export.start()
         asyncio.create_task(_prefetch_weekly_hours_field())
 
+        # HonestAI FAQ scraper — daily scrape of #ask-honestai that
+        # ships to the Apps Script Web App. Runs here (not in Apps
+        # Script) because Discord blocks GAS's outbound IPs on guild
+        # endpoints. Module lives in faq_scraper.py.
+        try:
+            import faq_scraper
+            faq_scraper.register(client)
+        except Exception as e:
+            print(f"[HAI] FAQ scraper registration failed: {e}")
+
 
 client.run(DISCORD_TOKEN)
