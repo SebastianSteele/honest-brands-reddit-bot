@@ -1355,6 +1355,51 @@ async def checkin_status(interaction: discord.Interaction):
 
 
 @tree.command(
+    name="hai_reset_watermark",
+    description="[Admin] Reset HonestAI scraper watermark — next scrape rewalks from the channel start",
+)
+@app_commands.default_permissions(administrator=True)
+async def hai_reset_watermark(interaction: discord.Interaction):
+    """Delete the FAQ scraper's watermark file so the next /hai_scrape_now
+    starts at the oldest message in #ask-honestai.
+
+    Use this when you've just enabled HAI_SIBLING_SCAN and want to
+    backfill answers for every previously-cached question — once the bot
+    re-ships a message with new answer text, the GAS cache's
+    mergeForUpsert_ will auto-clear the prior analysis for that row, the
+    next analyzer pass will reclassify it with the actual answer, and
+    answer_status will flip from "unanswered" to "answered".
+    """
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        import faq_scraper
+        cfg = faq_scraper._cfg()
+        path = cfg["state_path"]
+        existed = path.exists()
+        if existed:
+            path.unlink()
+        await interaction.followup.send(
+            (
+                f"✅ Watermark cleared (`{path}`).\n\n"
+                if existed else
+                f"ℹ️ No watermark file at `{path}` — already empty.\n\n"
+            ) + (
+                "Next `/hai_scrape_now` will rewalk from the channel start.\n"
+                "Reminder: enable `HAI_SIBLING_SCAN=true` in Railway env "
+                "vars first if you want the rescrape to detect inline "
+                "answers (otherwise this will just re-ship the same "
+                "answerless rows)."
+            ),
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Failed to reset watermark: `{e}`",
+            ephemeral=True,
+        )
+
+
+@tree.command(
     name="hai_scrape_now",
     description="[Admin] Force-run the HonestAI FAQ scrape right now",
 )
