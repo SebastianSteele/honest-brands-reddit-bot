@@ -24,22 +24,26 @@ else in bot.py needs to change.
 
 Environment variables (added to the bot's .env):
 
-    HAI_WEBHOOK_URL       Apps Script Web App /exec URL
-    HAI_WEBHOOK_SECRET    shared secret, same as Script Property in GAS
-    HAI_CHANNEL_ID        (optional) default 1402210105960693810
-    HAI_SCRAPE_HOUR_UTC   (optional) default 12 = 7am EDT / 8am EST
-    HAI_MAX_MESSAGES      (optional) cap per run, default 2000
+    HAI_WEBHOOK_URL        Apps Script Web App /exec URL
+    HAI_WEBHOOK_SECRET     shared secret, same as Script Property in GAS
+    HAI_CHANNEL_ID         (optional) default 1402210105960693810
+    HAI_SCRAPE_HOUR_LOCAL  (optional) hour-of-day in HAI_SCRAPE_TZ. Default 7
+                           (= 7am every morning, DST-aware).
+    HAI_SCRAPE_TZ          (optional) IANA tz name. Default America/New_York.
+    HAI_SCRAPE_HOUR_UTC    (optional, legacy) raw UTC hour. Only used if
+                           HAI_SCRAPE_HOUR_LOCAL is unset. Doesn't follow DST.
+    HAI_MAX_MESSAGES       (optional) cap per run, default 2000
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import time as dtime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
@@ -57,16 +61,35 @@ def _log(msg: str) -> None:
 
 DEFAULT_CHANNEL_ID = "1402210105960693810"
 DEFAULT_STATE_FILENAME = "faq_scraper_state.json"
+DEFAULT_SCRAPE_TZ = "America/New_York"
+DEFAULT_SCRAPE_HOUR_LOCAL = 7
 
 
 # ---------- config ----------
 
 def _cfg() -> dict[str, Any]:
+    # Scheduling: prefer HAI_SCRAPE_HOUR_LOCAL + HAI_SCRAPE_TZ (DST-aware,
+    # matches the rest of bot.py). HAI_SCRAPE_HOUR_UTC is kept as a legacy
+    # escape hatch — used only when the new var is unset and the user has
+    # explicitly opted into the old UTC behaviour.
+    hour_local_raw = os.getenv("HAI_SCRAPE_HOUR_LOCAL", "").strip()
+    hour_utc_raw = os.getenv("HAI_SCRAPE_HOUR_UTC", "").strip()
+    if hour_local_raw:
+        scrape_tz = (os.getenv("HAI_SCRAPE_TZ", "").strip() or DEFAULT_SCRAPE_TZ)
+        scrape_hour_local = int(hour_local_raw)
+    elif hour_utc_raw:
+        scrape_tz = "UTC"
+        scrape_hour_local = int(hour_utc_raw)
+    else:
+        scrape_tz = (os.getenv("HAI_SCRAPE_TZ", "").strip() or DEFAULT_SCRAPE_TZ)
+        scrape_hour_local = DEFAULT_SCRAPE_HOUR_LOCAL
+
     return {
         "channel_id": int(os.getenv("HAI_CHANNEL_ID", DEFAULT_CHANNEL_ID)),
         "webhook_url": os.getenv("HAI_WEBHOOK_URL", "").strip(),
         "webhook_secret": os.getenv("HAI_WEBHOOK_SECRET", "").strip(),
-        "scrape_hour_utc": int(os.getenv("HAI_SCRAPE_HOUR_UTC", "12")),
+        "scrape_tz": scrape_tz,
+        "scrape_hour_local": scrape_hour_local,
         # Default capped at 500 messages per run. All-time backfill
         # completes over multiple days' daily runs — this keeps any
         # single run fast enough to live inside Discord's rate-limit
@@ -350,17 +373,41 @@ async def run_once(client: discord.Client) -> dict[str, Any]:
 # ---------- daily task registration ----------
 
 _registered_client: discord.Client | None = None
+_daily_task = None
+
+
+def _build_scrape_time(cfg: dict[str, Any]) -> dtime:
+    """Construct the tz-aware time-of-day discord.ext.tasks.loop(time=...)
+    fires on. Using a tz-aware time means discord.py converts to UTC
+    internally each day and DST transitions are handled for free —
+    "7am America/New_York" stays 7am local across the spring-forward /
+    fall-back boundary. Mirrors the pattern used by weekly_reminder /
+    midweek_reminder in bot.py."""
+    try:
+        tz = ZoneInfo(cfg["scrape_tz"])
+    except Exception:
+        _log(f"unknown timezone {cfg['scrape_tz']!r} — falling back to UTC")
+        tz = timezone.utc
+    return dtime(
+        hour=int(cfg["scrape_hour_local"]),
+        minute=0, second=0,
+        tzinfo=tz,
+    )
 
 
 def register(client: discord.Client) -> None:
     """Mount the daily FAQ scrape task on the given client. Safe to call
     repeatedly (subsequent calls are no-ops)."""
-    global _registered_client
+    global _registered_client, _daily_task
     if _registered_client is client:
         return
     _registered_client = client
 
-    @tasks.loop(hours=24)
+    cfg = _cfg()
+    scrape_time = _build_scrape_time(cfg)
+    pretty_time = f"{scrape_time.hour:02d}:00 {cfg['scrape_tz']}"
+
+    @tasks.loop(time=scrape_time)
     async def _daily():
         try:
             await run_once(client)
@@ -371,16 +418,8 @@ def register(client: discord.Client) -> None:
     @_daily.before_loop
     async def _before():
         await client.wait_until_ready()
-        cfg = _cfg()
-        now = datetime.now(timezone.utc)
-        target = now.replace(
-            hour=cfg["scrape_hour_utc"], minute=0, second=0, microsecond=0,
-        )
-        if target <= now:
-            target = target + timedelta(days=1)
-        sleep_s = max(60, int((target - now).total_seconds()))
-        _log(f"scraper sleeping {sleep_s}s until first run at {target.isoformat()} UTC")
-        await asyncio.sleep(sleep_s)
+        _log(f"daily scrape armed: fires every day at {pretty_time}")
 
     _daily.start()
-    _log("daily scrape task registered (runs every 24h)")
+    _daily_task = _daily
+    _log(f"daily scrape task registered (time={pretty_time})")
