@@ -112,6 +112,50 @@ if _STATE_DIR_OVERRIDE:
         print(f"[STATE] could NOT create {STATE_DIR}: {_e} — falling back to script dir")
         STATE_DIR = os.path.dirname(__file__)
 
+
+def _state_diagnostic() -> None:
+    """Print every state file at boot with its existence + size, plus a
+    write-probe of STATE_DIR so we can tell at a glance whether the
+    Railway volume is actually attached and persisting writes between
+    redeploys.
+
+    If you ever see '[STATE] write-probe FAILED' or every state file
+    showing 'missing' on a redeploy after the bot had previously run,
+    the Railway volume mount path doesn't match STATE_DIR (case-
+    sensitive!) and writes are landing on ephemeral disk.
+    """
+    targets = {
+        "pending_checkins.json":   os.path.join(STATE_DIR, "pending_checkins.json"),
+        "checkin_data.json":       os.path.join(STATE_DIR, "checkin_data.json"),
+        "dm_blocked.json":         os.path.join(STATE_DIR, "dm_blocked.json"),
+        "known_accelerate.json":   os.path.join(STATE_DIR, "known_accelerate.json"),
+        "faq_scraper_state.json":  os.path.join(STATE_DIR, "faq_scraper_state.json"),
+    }
+    print(f"[STATE] dir exists: {os.path.isdir(STATE_DIR)}  path: {STATE_DIR}")
+    for label, path in targets.items():
+        if os.path.exists(path):
+            try:
+                size = os.path.getsize(path)
+                mtime = datetime.fromtimestamp(os.path.getmtime(path))
+                print(f"[STATE]   {label}: {size} bytes  mtime={mtime.isoformat(timespec='seconds')}")
+            except Exception as _se:
+                print(f"[STATE]   {label}: present but stat() failed: {_se}")
+        else:
+            print(f"[STATE]   {label}: missing")
+    probe = os.path.join(STATE_DIR, ".state_probe")
+    try:
+        with open(probe, "w") as _f:
+            _f.write(datetime.now().isoformat())
+        with open(probe, "r") as _f:
+            _ = _f.read()
+        os.remove(probe)
+        print(f"[STATE] write-probe OK ({STATE_DIR} is writable)")
+    except Exception as _e:
+        print(f"[STATE] write-probe FAILED: {_e}")
+
+
+_state_diagnostic()
+
 # File to persist pending new joiners awaiting their first check-in
 PENDING_FILE = os.path.join(STATE_DIR, "pending_checkins.json")
 
