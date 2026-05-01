@@ -65,6 +65,20 @@ DEFAULT_SCRAPE_TZ = "America/New_York"
 DEFAULT_SCRAPE_HOUR_LOCAL = 7
 
 
+def _default_state_dir() -> str:
+    """STATE_DIR (set in prod to e.g. /data) keeps the watermark file across
+    redeploys. Unset (local dev) falls back to the module's own directory."""
+    override = (os.getenv("STATE_DIR") or "").strip()
+    if override:
+        try:
+            os.makedirs(override, exist_ok=True)
+        except Exception as e:
+            _log(f"could not create STATE_DIR {override}: {e} — falling back to module dir")
+            return os.path.dirname(os.path.abspath(__file__))
+        return override
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 # ---------- config ----------
 
 def _cfg() -> dict[str, Any]:
@@ -84,6 +98,14 @@ def _cfg() -> dict[str, Any]:
         scrape_tz = (os.getenv("HAI_SCRAPE_TZ", "").strip() or DEFAULT_SCRAPE_TZ)
         scrape_hour_local = DEFAULT_SCRAPE_HOUR_LOCAL
 
+    # Watermark file: HAI_STATE_PATH (absolute path) wins; otherwise
+    # STATE_DIR/faq_scraper_state.json; otherwise next to this file.
+    state_path_override = (os.getenv("HAI_STATE_PATH") or "").strip()
+    if state_path_override:
+        state_path = Path(state_path_override)
+    else:
+        state_path = Path(_default_state_dir()) / DEFAULT_STATE_FILENAME
+
     return {
         "channel_id": int(os.getenv("HAI_CHANNEL_ID", DEFAULT_CHANNEL_ID)),
         "webhook_url": os.getenv("HAI_WEBHOOK_URL", "").strip(),
@@ -100,7 +122,7 @@ def _cfg() -> dict[str, Any]:
         # API-call budget up by ~30x. Off by default; turn on only once
         # the initial backfill has completed.
         "sibling_scan": os.getenv("HAI_SIBLING_SCAN", "false").lower() in ("1", "true", "yes", "on"),
-        "state_path": Path(os.getenv("HAI_STATE_PATH", DEFAULT_STATE_FILENAME)),
+        "state_path": state_path,
     }
 
 

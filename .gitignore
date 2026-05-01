@@ -2,4 +2,13 @@
 .DS_Store
 venv/
 __pycache__/
+
+# Runtime state — must never be committed. Production keeps these on a
+# Railway volume mounted at $STATE_DIR (e.g. /data). Locally they live
+# next to bot.py and are rebuilt on demand.
+pending_checkins.json
+checkin_data.json
+known_accelerate.json
+dm_blocked.json
 faq_scraper_state.json
+exports/

@@ -90,20 +90,42 @@ MEMBER_MAX_AGE_MONTHS = 7
 # Total weekly DMs in the new-member sequence (overridden by NEW_MEMBER_TOTAL_STEPS env var in testing)
 NEW_MEMBER_TOTAL_STEPS = int(os.getenv("NEW_MEMBER_TOTAL_STEPS", "4"))
 
+# Persistent state directory.
+#
+# On Railway/Heroku/etc. the container filesystem is ephemeral — every redeploy
+# wipes any file written next to bot.py. That used to silently reset
+# pending_checkins.json, known_accelerate.json, dm_blocked.json, AND
+# checkin_data.json (this last one was even committed to the repo so each
+# `git pull` during deploy clobbered live state with the snapshot from the
+# last commit).
+#
+# Set STATE_DIR=/data in production (with a Railway volume mounted at /data)
+# to keep all bot state across deploys. Unset locally to fall back to the
+# script directory — local dev keeps working unchanged.
+_STATE_DIR_OVERRIDE = (os.getenv("STATE_DIR") or "").strip()
+STATE_DIR = _STATE_DIR_OVERRIDE or os.path.dirname(__file__)
+if _STATE_DIR_OVERRIDE:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        print(f"[STATE] persistent state directory: {STATE_DIR}")
+    except Exception as _e:
+        print(f"[STATE] could NOT create {STATE_DIR}: {_e} — falling back to script dir")
+        STATE_DIR = os.path.dirname(__file__)
+
 # File to persist pending new joiners awaiting their first check-in
-PENDING_FILE = os.path.join(os.path.dirname(__file__), "pending_checkins.json")
+PENDING_FILE = os.path.join(STATE_DIR, "pending_checkins.json")
 
 # File to track weekly check-in submissions
-CHECKIN_DATA_FILE = os.path.join(os.path.dirname(__file__), "checkin_data.json")
+CHECKIN_DATA_FILE = os.path.join(STATE_DIR, "checkin_data.json")
 
 # File to track users who have DMs disabled (skip them instead of retrying)
-DM_BLOCKED_FILE = os.path.join(os.path.dirname(__file__), "dm_blocked.json")
+DM_BLOCKED_FILE = os.path.join(STATE_DIR, "dm_blocked.json")
 
 # Stages where follow-up DMs stop (from check-in form selection)
 ADVANCED_STAGES = {"4. Getting sales", "5. Scaling"}
 
 # File to track which Accelerate members have been seen (so only NEW ones get the onboarding sequence)
-KNOWN_MEMBERS_FILE = os.path.join(os.path.dirname(__file__), "known_accelerate.json")
+KNOWN_MEMBERS_FILE = os.path.join(STATE_DIR, "known_accelerate.json")
 
 # DM pacing: send in batches to avoid spam detection
 DM_DELAY_MIN = 8   # minimum seconds between DMs
@@ -1814,8 +1836,9 @@ async def monthly_export():
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(f"[EXPORT] Webhook error: {e}")
     else:
-        # No webhook — write to file as fallback
-        export_dir = os.path.join(os.path.dirname(__file__), "exports")
+        # No webhook — write to file as fallback (under STATE_DIR so the
+        # exports survive redeploys when a volume is mounted).
+        export_dir = os.path.join(STATE_DIR, "exports")
         os.makedirs(export_dir, exist_ok=True)
         export_path = os.path.join(export_dir, f"checkins_{month_label}.json")
         with open(export_path, "w") as f:
