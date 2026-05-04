@@ -12,3 +12,7 @@ known_accelerate.json
 dm_blocked.json
 faq_scraper_state.json
 exports/
+
+# Operational artifacts (handoff CSVs, ad-hoc debug scripts) — never deploy.
+missing_discord_usernames.csv
+debug_clickup.py

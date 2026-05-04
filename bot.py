@@ -179,7 +179,17 @@ DM_BATCH_PAUSE = 60  # seconds to pause between batches
 
 
 # --- ClickUp-based Accelerate member lookup (cached) ---
-_accelerate_cache: dict = {"usernames": set(), "last_fetched": None}
+# `missing_username` holds Accelerate members whose Discord-username field is
+# blank.  Without this, those members are silently dropped from the DM loop
+# (the eligibility filter `member.name.lower() not in accelerate_usernames`
+# fails closed) and we only find out when someone files a "I never got the
+# check-in DM" ticket weeks later.  Surfacing the list both at refresh time
+# and through /checkin_status makes the failure mode loud.
+_accelerate_cache: dict = {
+    "usernames":        set(),
+    "missing_username": [],   # list of {"name": str, "task_id": str, "status": str}
+    "last_fetched":     None,
+}
 _CACHE_TTL = timedelta(hours=1)
 
 
@@ -193,6 +203,7 @@ async def fetch_accelerate_usernames() -> set:
 
     headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
     usernames = set()
+    missing_username: list[dict] = []
     page = 0
 
     async with aiohttp.ClientSession() as session:
@@ -224,16 +235,49 @@ async def fetch_accelerate_usernames() -> set:
                         program_name_val = cf.get("value")
                     elif cf.get("id") == CU_FIELD_DISCORD_USERNAME:
                         discord_username = (cf.get("value") or "").strip()
-                if (program_name_val is not None
-                        and int(program_name_val) == CU_PROGRAM_ACCELERATE_INDEX
-                        and discord_username):
+                is_accelerate = (
+                    program_name_val is not None
+                    and int(program_name_val) == CU_PROGRAM_ACCELERATE_INDEX
+                )
+                if is_accelerate and discord_username:
                     usernames.add(discord_username.lower())
+                elif is_accelerate and not discord_username:
+                    missing_username.append({
+                        "name": task.get("name") or "(unnamed)",
+                        "task_id": task.get("id") or "",
+                        "status": (task.get("status") or {}).get("status", ""),
+                    })
             page += 1
 
     _accelerate_cache["usernames"] = usernames
+    _accelerate_cache["missing_username"] = missing_username
     _accelerate_cache["last_fetched"] = now
     print(f"[CLICKUP] Refreshed Accelerate cache: {len(usernames)} members")
+    if missing_username:
+        # Loud warning so this shows up in Heroku/Railway logs the moment a
+        # new Accelerate member is created without a Discord handle.
+        print(
+            f"[CLICKUP] WARN: {len(missing_username)} Accelerate member(s) have a "
+            f"BLANK Discord username and will NOT receive check-in DMs:"
+        )
+        for entry in missing_username[:20]:
+            print(
+                f"          - {entry['name']!r} "
+                f"(status={entry['status']}, task=https://app.clickup.com/t/{entry['task_id']})"
+            )
+        if len(missing_username) > 20:
+            print(f"          ... and {len(missing_username) - 20} more (run /checkin_status to see all)")
     return usernames
+
+
+def get_accelerate_missing_username() -> list[dict]:
+    """Return the cached list of Accelerate members with a blank Discord username.
+
+    Read-only accessor for /checkin_status — the cache is populated as a side
+    effect of fetch_accelerate_usernames(), so callers must call that first
+    (or rely on a recent prior refresh) to get current data.
+    """
+    return list(_accelerate_cache.get("missing_username") or [])
 
 
 def is_within_join_window(member: discord.Member) -> bool:
@@ -1384,15 +1428,47 @@ async def checkin_status(interaction: discord.Interaction):
         reason_text = f" — {', '.join(reasons)}" if reasons else ""
         lines.append(f"{status} **{member.display_name}** (joined {joined_str}){reason_text}")
 
-    if not lines:
-        await interaction.followup.send(
-            f"No Accelerate members found in Discord.\n"
-            f"ClickUp has {len(accelerate_usernames)} Accelerate usernames: {', '.join(sorted(accelerate_usernames)) or 'none'}",
-            ephemeral=True,
+    # Surface Accelerate members in ClickUp who are silently filtered out
+    # because their Discord username field is blank.  These never appear in
+    # the eligibility loop above because they're missing from
+    # `accelerate_usernames`, so without this section the operator has no
+    # way to know they exist short of opening every ClickUp row by hand.
+    missing_dc = get_accelerate_missing_username()
+    missing_block = ""
+    if missing_dc:
+        missing_lines = []
+        for entry in missing_dc[:25]:
+            url = f"https://app.clickup.com/t/{entry['task_id']}" if entry.get("task_id") else ""
+            status = entry.get("status") or "?"
+            missing_lines.append(f"⚠️ **{entry['name']}** (status={status}) — {url}")
+        more = ""
+        if len(missing_dc) > 25:
+            more = f"\n... and {len(missing_dc) - 25} more"
+        missing_block = (
+            f"\n\n**Accelerate members with BLANK Discord username "
+            f"(silently skipped — fix in ClickUp):** {len(missing_dc)}\n"
+            + "\n".join(missing_lines)
+            + more
         )
+
+    if not lines:
+        body = (
+            f"No Accelerate members found in Discord.\n"
+            f"ClickUp has {len(accelerate_usernames)} Accelerate usernames: "
+            f"{', '.join(sorted(accelerate_usernames)) or 'none'}"
+            f"{missing_block}"
+        )
+        if len(body) > 1900:
+            body = body[:1900] + "\n... (truncated)"
+        await interaction.followup.send(body, ephemeral=True)
         return
 
-    msg = f"**Accelerate Members — Eligibility Report**\n(Source: ClickUp Program Name | Filter: joined within {MEMBER_MAX_AGE_MONTHS} months)\n\n" + "\n".join(lines)
+    msg = (
+        f"**Accelerate Members — Eligibility Report**\n"
+        f"(Source: ClickUp Program Name | Filter: joined within {MEMBER_MAX_AGE_MONTHS} months)\n\n"
+        + "\n".join(lines)
+        + missing_block
+    )
     if len(msg) > 1900:
         msg = msg[:1900] + "\n... (truncated)"
     await interaction.followup.send(msg, ephemeral=True)
