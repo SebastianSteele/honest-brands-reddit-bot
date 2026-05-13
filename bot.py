@@ -62,6 +62,13 @@ CU_PROGRAM_ACCELERATE_INDEX = 1  # orderindex for "Accelerate" in the dropdown
 # ClickUp Member Database — Coach field (users type)
 CU_FIELD_COACH = "3c4c9ce5-07f5-4aa3-a0bf-1dbca6c9efe3"
 
+# Member Database fields written when a member submits product info via the bot.
+# Listings Reviewed is a numeric counter (incremented +1 per submission); Latest
+# Call Topic is a text field overwritten with "Product: <name> — <link>" so
+# coaches see the freshest product info at a glance on the contact page.
+CU_FIELD_LISTINGS_REVIEWED = "22bdd321-6b51-4324-83d0-4878e9ddc3b8"
+CU_FIELD_LATEST_CALL_TOPIC = "fdebf899-a6b3-4216-81f1-f40e26602d54"
+
 # Program Name dropdown options (orderindex → name)
 PROGRAM_NAMES = {0: "Core", 1: "Accelerate", 2: "Scale", 3: "Velocity"}
 
@@ -75,20 +82,25 @@ CI_FIELD_WEEK = "7160ff5a-8278-4d17-8c71-b9c13f04a1a6"
 CI_FIELD_WEEKS_IN_STAGE = "2710fa28-d9bd-4462-b9c6-b8e346144518"
 CI_FIELD_WHAT_WOULD_HELP = "074c35ab-2ad6-466c-ab8e-685aea688d86"
 
-# Map bot stages to ClickUp Milestone dropdown options
+# Map bot stages to ClickUp Milestone dropdown options. Until a "Launched Ads"
+# milestone is added in ClickUp, "4. Launched Ads" maps to "3. Make Ads".
 STAGE_TO_MILESTONE = {
-    "1. Finding a product": "1. Select a Product",
-    "2. Building a store": "2. Build Site",
-    "3. Creating ads": "3. Make Ads",
-    "4. Getting sales": "4. First Sale",
-    "5. Scaling": "5. Scaling",
+    "1. Finding a Product": "1. Select a Product",
+    "2. Building a Store": "2. Build Site",
+    "3. Creating Ads": "3. Make Ads",
+    "4. Launched Ads": "3. Make Ads",
+    "5. Making Sales": "4. First Sale",
+    "6. Scaling Brand": "5. Scaling",
 }
 
-# Only DM members who joined within this many months
-MEMBER_MAX_AGE_MONTHS = 7
+# Eligibility — only DM Accelerate members who joined Discord on/after this
+# date AND are within their first CHECKIN_WEEKS_CAP weeks. After 12 weeks the
+# member rolls off the DM list automatically.
+MEMBER_JOIN_CUTOFF = datetime(2026, 3, 1, tzinfo=timezone.utc)
+CHECKIN_WEEKS_CAP = 12
 
 # Total weekly DMs in the new-member sequence (overridden by NEW_MEMBER_TOTAL_STEPS env var in testing)
-NEW_MEMBER_TOTAL_STEPS = int(os.getenv("NEW_MEMBER_TOTAL_STEPS", "4"))
+NEW_MEMBER_TOTAL_STEPS = int(os.getenv("NEW_MEMBER_TOTAL_STEPS", "12"))
 
 # Persistent state directory.
 #
@@ -129,6 +141,7 @@ def _state_diagnostic() -> None:
         "checkin_data.json":       os.path.join(STATE_DIR, "checkin_data.json"),
         "dm_blocked.json":         os.path.join(STATE_DIR, "dm_blocked.json"),
         "known_accelerate.json":   os.path.join(STATE_DIR, "known_accelerate.json"),
+        "member_product_info.json": os.path.join(STATE_DIR, "member_product_info.json"),
         "faq_scraper_state.json":  os.path.join(STATE_DIR, "faq_scraper_state.json"),
     }
     print(f"[STATE] dir exists: {os.path.isdir(STATE_DIR)}  path: {STATE_DIR}")
@@ -165,11 +178,23 @@ CHECKIN_DATA_FILE = os.path.join(STATE_DIR, "checkin_data.json")
 # File to track users who have DMs disabled (skip them instead of retrying)
 DM_BLOCKED_FILE = os.path.join(STATE_DIR, "dm_blocked.json")
 
-# Stages where follow-up DMs stop (from check-in form selection)
-ADVANCED_STAGES = {"4. Getting sales", "5. Scaling"}
+# Stages where follow-up DMs stop (from check-in form selection).
+# Both the new 6-stage labels and the legacy 5-stage labels are listed so
+# previously submitted check-ins still mark the member as advanced.
+ADVANCED_STAGES = {
+    # New 6-stage system
+    "5. Making Sales",
+    "6. Scaling Brand",
+    # Legacy 5-stage labels (still present on older check-in tasks)
+    "4. Getting sales",
+    "5. Scaling",
+}
 
 # File to track which Accelerate members have been seen (so only NEW ones get the onboarding sequence)
 KNOWN_MEMBERS_FILE = os.path.join(STATE_DIR, "known_accelerate.json")
+
+# File to cache each member's product name + link so we only ask once
+PRODUCT_INFO_FILE = os.path.join(STATE_DIR, "member_product_info.json")
 
 # DM pacing: send in batches to avoid spam detection
 DM_DELAY_MIN = 8   # minimum seconds between DMs
@@ -281,11 +306,19 @@ def get_accelerate_missing_username() -> list[dict]:
 
 
 def is_within_join_window(member: discord.Member) -> bool:
-    """Return True if the member joined within MEMBER_MAX_AGE_MONTHS."""
+    """Return True if the member is in their first CHECKIN_WEEKS_CAP weeks AND
+    joined Discord on or after MEMBER_JOIN_CUTOFF.
+
+    The cohort scope is intentionally tight — coaching check-ins target newer
+    Accelerate members through their first 12 weeks. After that they roll off
+    automatically.
+    """
     if member.joined_at is None:
         return False
-    cutoff = datetime.now(timezone.utc) - timedelta(days=MEMBER_MAX_AGE_MONTHS * 30)
-    return member.joined_at >= cutoff
+    if member.joined_at < MEMBER_JOIN_CUTOFF:
+        return False
+    weeks_since_join = (datetime.now(timezone.utc) - member.joined_at).days / 7
+    return weeks_since_join < CHECKIN_WEEKS_CAP
 
 
 # --- ClickUp-based Stage 4/5 exclusion (checks submitted check-ins) ---
@@ -356,20 +389,45 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Stage options matching the website exactly
+# Stage options — 6-stage funnel from the spec
 STAGE_OPTIONS = [
-    ("1. Finding a product", "1. Finding a product"),
-    ("2. Building a store", "2. Building a store"),
-    ("3. Creating ads", "3. Creating ads"),
-    ("4. Getting sales", "4. Getting sales"),
-    ("5. Scaling", "5. Scaling"),
+    ("1. Finding a Product", "1. Finding a Product"),
+    ("2. Building a Store", "2. Building a Store"),
+    ("3. Creating Ads", "3. Creating Ads"),
+    ("4. Launched Ads", "4. Launched Ads"),
+    ("5. Making Sales", "5. Making Sales"),
+    ("6. Scaling Brand", "6. Scaling Brand"),
 ]
 
+# Stages where we ask for product name + link (one-time capture).
+# Anyone past "Finding a Product" should have something to point at.
+PRODUCT_INFO_STAGES = {
+    "2. Building a Store",
+    "3. Creating Ads",
+    "4. Launched Ads",
+    "5. Making Sales",
+    "6. Scaling Brand",
+}
+
+
+def _stage_requires_product_info(stage: str) -> bool:
+    return stage in PRODUCT_INFO_STAGES
+
+
 HOURS_OPTIONS = [
-    ("Less than an hour", "Less than an hour"),
-    ("Two to four hours", "Two to four hours"),
-    ("Five to ten hours", "Five to ten hours"),
+    ("Didn't have much time", "Didn't have much time"),
+    ("1–4 hours", "1–4 hours"),
+    ("5–10 hours", "5–10 hours"),
     ("10+ hours", "10+ hours"),
+]
+
+# Mood / progress confidence — final dropdown before the form opens
+FEELING_OPTIONS = [
+    ("Locked in", "Locked in"),
+    ("Confident I'll make progress", "Confident I'll make progress"),
+    ("A bit stuck", "A bit stuck"),
+    ("Overwhelmed", "Overwhelmed"),
+    ("Completely blocked", "Completely blocked"),
 ]
 
 # Band for number fields / exports: 1 = <1h … 4 = 10+h
@@ -699,6 +757,41 @@ def is_dm_blocked(user_id) -> bool:
     return str(user_id) in _load_dm_blocked()
 
 
+# --- Member product info persistence ---
+# Once a member tells us their product name + link, we cache it locally and
+# never ask again. Future check-ins include the saved info in the task
+# description so coaches can see what each person is working on without having
+# to re-ask.
+def _load_product_info() -> dict:
+    if os.path.exists(PRODUCT_INFO_FILE):
+        with open(PRODUCT_INFO_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_product_info(data: dict):
+    with open(PRODUCT_INFO_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_product_info(discord_username: str) -> dict | None:
+    return _load_product_info().get((discord_username or "").lower())
+
+
+def has_product_info(discord_username: str) -> bool:
+    return get_product_info(discord_username) is not None
+
+
+def save_member_product_info(discord_username: str, product_name: str, product_link: str):
+    data = _load_product_info()
+    data[(discord_username or "").lower()] = {
+        "product_name": (product_name or "").strip(),
+        "product_link": (product_link or "").strip(),
+        "captured_at": datetime.now().isoformat(),
+    }
+    _save_product_info(data)
+
+
 # --- Pending check-ins persistence ---
 def load_pending() -> dict:
     if os.path.exists(PENDING_FILE):
@@ -828,6 +921,66 @@ async def update_member_profile(task_id: str, stage: str,
             print(f"[CLICKUP] Field update error on {task_id}: {e}")
     else:
         print(f"[CLICKUP] Updated member profile: {task_id}")
+
+
+async def save_product_info_to_member_db(discord_username: str,
+                                         product_name: str,
+                                         product_link: str) -> None:
+    """When a member shares their product via the bot, bump 'Listings Reviewed'
+    +1 and overwrite 'Latest Call Topic' with the product info so coaches see
+    it on the contact page."""
+    try:
+        member_task = await find_member_by_discord(discord_username)
+    except Exception as e:
+        print(f"[CLICKUP] Product info — member lookup error for {discord_username}: {e}")
+        return
+    if not member_task:
+        print(f"[CLICKUP] Product info — no member match for {discord_username!r}")
+        return
+
+    task_id = member_task["id"]
+
+    current_count = 0
+    for cf in member_task.get("custom_fields", []):
+        if cf.get("id") == CU_FIELD_LISTINGS_REVIEWED:
+            try:
+                current_count = int(float(cf.get("value") or 0))
+            except (TypeError, ValueError):
+                current_count = 0
+            break
+
+    pname = (product_name or "").strip()
+    plink = (product_link or "").strip()
+    topic = (
+        f"Product: {pname} — {plink}".strip(" —")
+        if (pname or plink)
+        else ""
+    )
+
+    headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
+    async with aiohttp.ClientSession() as session:
+        async def _set_field(field_id, value, label):
+            try:
+                async with session.post(
+                    f"https://api.clickup.com/api/v2/task/{task_id}/field/{field_id}",
+                    json={"value": value},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        print(f"[CLICKUP] Product info — {label} update {r.status}: {body[:300]}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"[CLICKUP] Product info — {label} network error: {e}")
+
+        await _set_field(CU_FIELD_LISTINGS_REVIEWED, current_count + 1, "Listings Reviewed")
+        if topic:
+            await _set_field(CU_FIELD_LATEST_CALL_TOPIC, topic, "Latest Call Topic")
+
+    print(
+        f"[CLICKUP] Product info saved to member {task_id} "
+        f"(Listings Reviewed: {current_count} → {current_count + 1})"
+    )
 
 
 # --- Public check-in confirmation in 1-1 ticket channels ---
@@ -1020,7 +1173,10 @@ async def post_public_checkin_confirmation(client: discord.Client, user: discord
             labels = _coach_assignee_labels(member_task)
             coach_ping = await _resolve_coach_mentions_async(guild, labels)
 
-        body = f"{user.mention} **Check-in received** — thanks! Your weekly update was logged."
+        body = (
+            f"{user.mention} **Check-in received** — thanks! Your coaching team "
+            "will review this to help you make progress."
+        )
         if coach_ping:
             body = f"{coach_ping}\n{body}"
 
@@ -1035,11 +1191,12 @@ async def post_public_checkin_confirmation(client: discord.Client, user: discord
 
 
 # --- Check-in Modal (the popup form) ---
-class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
-    def __init__(self, selected_stage: str, weekly_hours: str):
+class CheckInModal(discord.ui.Modal, title="Weekly Coach Check-in"):
+    def __init__(self, selected_stage: str, weekly_hours: str, feeling: str):
         super().__init__()
         self.selected_stage = selected_stage
         self.weekly_hours = weekly_hours
+        self.feeling = feeling
 
     weeks = discord.ui.TextInput(
         label="How many weeks have you been in this stage?",
@@ -1048,20 +1205,20 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
         max_length=10,
     )
     blocker = discord.ui.TextInput(
-        label="Main thing slowing you down right now?",
-        placeholder="What's the biggest obstacle right now?",
+        label="What's blocking your progress right now?",
+        placeholder="Be specific.",
         style=discord.TextStyle.paragraph,
         max_length=1000,
     )
     help_needed = discord.ui.TextInput(
-        label="What would help you progress faster?",
-        placeholder="What support, resources, or changes would make a difference?",
+        label="What kind of support would help you most?",
+        placeholder="Be specific.",
         style=discord.TextStyle.paragraph,
         max_length=1000,
     )
     next_steps = discord.ui.TextInput(
-        label="Steps you'll take this week to move forward?",
-        placeholder="What specific actions will you commit to this week?",
+        label="The ONE key thing to get done this week?",
+        placeholder="Be specific.",
         style=discord.TextStyle.paragraph,
         max_length=1000,
     )
@@ -1085,6 +1242,18 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
             {"id": CI_FIELD_NEXT_STEPS, "value": self.next_steps.value},
         ]
 
+        # Pull saved product info (if any) so it shows on every check-in task
+        product = get_product_info(interaction.user.name)
+        product_lines = ""
+        if product:
+            pname = product.get("product_name") or ""
+            plink = product.get("product_link") or ""
+            if pname or plink:
+                product_lines = (
+                    f"**Product:** {pname}\n\n"
+                    f"**Product Link:** {plink}\n\n"
+                )
+
         # Respond to Discord immediately (must be within 3 seconds)
         await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -1107,11 +1276,13 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                         f"**Date:** {today}\n\n"
                         f"---\n\n"
                         f"**Stage:** {self.selected_stage}\n\n"
+                        f"{product_lines}"
                         f"**Hours Spent This Week:** {self.weekly_hours}\n\n"
                         f"**Weeks in Stage:** {self.weeks.value}\n\n"
+                        f"**Feeling About Progress:** {self.feeling}\n\n"
                         f"**Blocker:** {self.blocker.value}\n\n"
-                        f"**What Would Help:** {self.help_needed.value}\n\n"
-                        f"**Next Steps:** {self.next_steps.value}"
+                        f"**Support That Would Help:** {self.help_needed.value}\n\n"
+                        f"**ONE Key Thing This Week:** {self.next_steps.value}"
                     ),
                     "priority": 3,
                     "tags": ["check-in", interaction.user.name],
@@ -1138,7 +1309,8 @@ class CheckInModal(discord.ui.Modal, title="Weekly Accountability Check-in"):
                 unmark_dm_blocked(interaction.user.id)
 
                 await interaction.followup.send(
-                    "✅ **Check-in submitted!** Your progress has been logged. Have a great week!",
+                    "Thanks for checking in — clarity creates momentum 💪\n"
+                    "Your coaching team will review this to help you make progress 👊",
                     ephemeral=True,
                 )
                 print(f"[OK] Check-in from {interaction.user.display_name}")
@@ -1283,6 +1455,81 @@ async def _enrich_checkin_task(checkin_task_id, member_task, discord_username):
             print(f"[CLICKUP] Error enriching check-in task: {e}")
 
 
+# --- Product Info Modal (first-time capture for stage 2+) ---
+class ProductInfoModal(discord.ui.Modal, title="Tell us about your product"):
+    """Asked once per member, only when they pick stage 2+ for the first time.
+    Saves to the local product info cache; future check-ins read from there and
+    skip this modal entirely."""
+
+    def __init__(self, selected_stage: str, weekly_hours: str, feeling: str):
+        super().__init__()
+        self.selected_stage = selected_stage
+        self.weekly_hours = weekly_hours
+        self.feeling = feeling
+
+    product_name = discord.ui.TextInput(
+        label="What is your product called?",
+        placeholder="e.g., GlowSerum Pro",
+        style=discord.TextStyle.short,
+        max_length=200,
+    )
+    product_link = discord.ui.TextInput(
+        label="Can you share a link?",
+        placeholder="e.g., yourstore.com/product",
+        style=discord.TextStyle.short,
+        max_length=500,
+        required=False,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        save_member_product_info(
+            interaction.user.name,
+            self.product_name.value,
+            self.product_link.value,
+        )
+        asyncio.create_task(save_product_info_to_member_db(
+            interaction.user.name,
+            self.product_name.value,
+            self.product_link.value,
+        ))
+        view = ContinueCheckinView(
+            selected_stage=self.selected_stage,
+            weekly_hours=self.weekly_hours,
+            feeling=self.feeling,
+        )
+        await interaction.response.send_message(
+            "✅ Got it — product saved.\n\n**Last step — open your check-in:**",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class ContinueCheckinView(discord.ui.View):
+    """Intermediate button shown after product info is captured. Clicking it
+    opens the main CheckInModal — needed because Discord won't let us push two
+    modals back-to-back without a user interaction in between."""
+
+    def __init__(self, selected_stage: str, weekly_hours: str, feeling: str):
+        super().__init__(timeout=300)
+        self.selected_stage = selected_stage
+        self.weekly_hours = weekly_hours
+        self.feeling = feeling
+
+    @discord.ui.button(
+        label="Continue Check-in",
+        style=discord.ButtonStyle.green,
+        emoji="📋",
+    )
+    async def continue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            CheckInModal(
+                selected_stage=self.selected_stage,
+                weekly_hours=self.weekly_hours,
+                feeling=self.feeling,
+            ),
+        )
+
+
 # --- Stage Select Menu (dropdown before modal) ---
 class StageSelect(discord.ui.Select):
     def __init__(self):
@@ -1299,9 +1546,8 @@ class StageSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         selected_stage = self.values[0]
         await interaction.response.send_message(
-            "**Step 2 of 2 — Hours this week**\n"
-            "Choose roughly how many hours you’ve spent on the business this week, "
-            "then the check-in form will open.",
+            "**Step 2 of 3 — Hours this week**\n"
+            "Choose roughly how much time you dedicated last week.",
             view=HoursSelectView(selected_stage=selected_stage),
             ephemeral=True,
         )
@@ -1321,18 +1567,21 @@ class HoursSelect(discord.ui.Select):
             for label, value in HOURS_OPTIONS
         ]
         super().__init__(
-            placeholder="How many hours this week?",
+            placeholder="How much time did you dedicate last week?",
             options=options,
             custom_id="hours_select",
         )
 
     async def callback(self, interaction: discord.Interaction):
         selected_hours = self.values[0]
-        await interaction.response.send_modal(
-            CheckInModal(
+        await interaction.response.send_message(
+            "**Step 3 of 3 — How are you feeling?**\n"
+            "Pick the mood that fits your progress this week, then the form opens.",
+            view=FeelingSelectView(
                 selected_stage=self.selected_stage,
                 weekly_hours=selected_hours,
             ),
+            ephemeral=True,
         )
 
 
@@ -1340,6 +1589,50 @@ class HoursSelectView(discord.ui.View):
     def __init__(self, selected_stage: str):
         super().__init__(timeout=300)
         self.add_item(HoursSelect(selected_stage=selected_stage))
+
+
+class FeelingSelect(discord.ui.Select):
+    def __init__(self, selected_stage: str, weekly_hours: str):
+        self.selected_stage = selected_stage
+        self.weekly_hours = weekly_hours
+        options = [
+            discord.SelectOption(label=label, value=value)
+            for label, value in FEELING_OPTIONS
+        ]
+        super().__init__(
+            placeholder="How are you feeling about progress this week?",
+            options=options,
+            custom_id="feeling_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        feeling = self.values[0]
+        needs_product = (
+            _stage_requires_product_info(self.selected_stage)
+            and not has_product_info(interaction.user.name)
+        )
+        if needs_product:
+            await interaction.response.send_modal(
+                ProductInfoModal(
+                    selected_stage=self.selected_stage,
+                    weekly_hours=self.weekly_hours,
+                    feeling=feeling,
+                ),
+            )
+        else:
+            await interaction.response.send_modal(
+                CheckInModal(
+                    selected_stage=self.selected_stage,
+                    weekly_hours=self.weekly_hours,
+                    feeling=feeling,
+                ),
+            )
+
+
+class FeelingSelectView(discord.ui.View):
+    def __init__(self, selected_stage: str, weekly_hours: str):
+        super().__init__(timeout=300)
+        self.add_item(FeelingSelect(selected_stage=selected_stage, weekly_hours=weekly_hours))
 
 
 # --- Button that opens the stage select ---
@@ -1356,20 +1649,22 @@ class CheckInButton(discord.ui.View):
     async def start_checkin(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = StageSelectView()
         await interaction.response.send_message(
-            "**Step 1 of 2 — Stage**\n"
-            "Pick the stage you’re in. **Next**, you’ll pick **hours spent this week**, then the form opens.",
+            "**Step 1 of 3 — Stage**\n"
+            "Pick the stage you're at. **Next** you'll pick **hours** and **how you're feeling**, "
+            "then the form opens.",
             view=view,
             ephemeral=True,
         )
 
 
 # --- Slash command: /checkin ---
-@tree.command(name="checkin", description="Submit your weekly accountability check-in")
+@tree.command(name="checkin", description="Submit your weekly coach check-in")
 async def checkin_command(interaction: discord.Interaction):
     view = StageSelectView()
     await interaction.response.send_message(
-        "**Step 1 of 2 — Stage**\n"
-        "Pick the stage you’re in. **Next**, you’ll pick **hours spent this week**, then the form opens.",
+        "**Step 1 of 3 — Stage**\n"
+        "Pick the stage you're at. **Next** you'll pick **hours** and **how you're feeling**, "
+        "then the form opens.",
         view=view,
         ephemeral=True,
     )
@@ -1383,10 +1678,10 @@ async def trigger_checkins(interaction: discord.Interaction):
     try:
         await _send_checkin_dms(
             "manual_trigger",
-            "**📋 Weekly Check-in Time!**\n\n"
-            "It's time for your weekly accountability check-in.\n"
-            "Click the button below to submit your progress update.\n\n"
-            "*This helps us keep your support aligned each week.*",
+            "**📋 Weekly Coach Check-in**\n\n"
+            "Time for your weekly coach check-in.\n"
+            "Click the button below to share where you're at.\n\n"
+            "*Your coaching team uses this to help you make progress.*",
         )
         await interaction.followup.send("✅ Check-in DMs sent!", ephemeral=True)
     except Exception as e:
@@ -1401,7 +1696,7 @@ async def checkin_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     accelerate_usernames = await fetch_accelerate_usernames()
     excluded_ids = await fetch_excluded_user_ids()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=MEMBER_MAX_AGE_MONTHS * 30)
+    weeks_cutoff = datetime.now(timezone.utc) - timedelta(weeks=CHECKIN_WEEKS_CAP)
     lines = []
     for member in interaction.guild.members:
         if member.bot:
@@ -1412,14 +1707,19 @@ async def checkin_status(interaction: discord.Interaction):
         joined_str = joined.strftime("%b %d, %Y") if joined else "unknown"
         reasons = []
         eligible = True
-        if joined and joined < cutoff:
-            reasons.append(f"joined {joined_str} (>{MEMBER_MAX_AGE_MONTHS} months ago)")
+        if joined and joined < MEMBER_JOIN_CUTOFF:
+            reasons.append(
+                f"joined {joined_str} (before {MEMBER_JOIN_CUTOFF.strftime('%b %d, %Y')} cutoff)"
+            )
+            eligible = False
+        if joined and joined < weeks_cutoff:
+            reasons.append(f"joined {joined_str} (>{CHECKIN_WEEKS_CAP} weeks ago)")
             eligible = False
         if has_checked_in(member.id):
             reasons.append("already checked in this week")
             eligible = False
         if is_advanced_stage(member.id, excluded_ids):
-            reasons.append("Stage 4/5")
+            reasons.append("Making Sales / Scaling Brand")
             eligible = False
         if is_dm_blocked(member.id):
             reasons.append("DMs blocked")
@@ -1465,7 +1765,9 @@ async def checkin_status(interaction: discord.Interaction):
 
     msg = (
         f"**Accelerate Members — Eligibility Report**\n"
-        f"(Source: ClickUp Program Name | Filter: joined within {MEMBER_MAX_AGE_MONTHS} months)\n\n"
+        f"(Source: ClickUp Program Name | Filter: joined "
+        f"≥ {MEMBER_JOIN_CUTOFF.strftime('%b %d, %Y')} "
+        f"and within first {CHECKIN_WEEKS_CAP} weeks)\n\n"
         + "\n".join(lines)
         + missing_block
     )
@@ -1652,84 +1954,85 @@ async def before_scan():
     await client.wait_until_ready()
 
 
-# Messages for each step of the new-member check-in sequence
+# Messages for each step of the new-member coach check-in sequence.
+# After step 12 the member rolls off and stops receiving DMs (12-week program).
 _NEW_MEMBER_MESSAGES = {
     1: (
-        "**📋 Welcome to your first Check-in!**\n\n"
-        "You've been with us for a week now — time for your first accountability check-in.\n"
-        "Click the button below to submit your progress update.\n\n"
-        "*This helps us keep your support aligned each week.*"
+        "**📋 Welcome to your first Coach Check-in!**\n\n"
+        "You've been with us for a week — time for your first coach check-in.\n"
+        "Click the button below to share where you're at.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     2: (
-        "**📋 Week 2 Check-in**\n\n"
-        "Two weeks in — great to have you here! Time to log your progress.\n"
-        "Click the button below to submit your weekly check-in.\n\n"
-        "*Your CSM uses this to tailor support for you.*"
+        "**📋 Week 2 Coach Check-in**\n\n"
+        "Two weeks in — let's see where you're at.\n"
+        "Click the button below to share your update.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     3: (
-        "**📋 Week 3 Check-in**\n\n"
-        "You're three weeks in — keep the momentum going!\n"
-        "Click the button below to submit your weekly check-in.\n\n"
-        "*Consistent check-ins = faster progress.*"
+        "**📋 Week 3 Coach Check-in**\n\n"
+        "Three weeks in — keep the momentum going.\n"
+        "Click the button below to share your update.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     4: (
-        "**📋 Week 4 Check-in**\n\n"
-        "Four weeks with us — incredible progress so far!\n"
-        "Click the button below to submit your weekly check-in.\n\n"
-        "*Keep it up — consistency is everything.*"
+        "**📋 Week 4 Coach Check-in**\n\n"
+        "One month in — share where you're at this week.\n"
+        "Click the button below to submit your check-in.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     5: (
-        "**📋 Week 5 Check-in**\n\n"
-        "Five weeks in — you're building great habits!\n"
-        "Click the button below to submit your weekly check-in.\n\n"
-        "*Your CSM uses this to tailor support for you.*"
+        "**📋 Week 5 Coach Check-in**\n\n"
+        "Five weeks in — you're building real habits.\n"
+        "Click the button below to share your update.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     6: (
-        "**📋 Week 6 Check-in**\n\n"
-        "Six weeks in — stay focused on your next milestone.\n"
-        "Click the button below to submit your weekly check-in.\n\n"
-        "*Consistent check-ins = faster progress.*"
+        "**📋 Week 6 Coach Check-in**\n\n"
+        "Halfway through your 12-week program — keep going.\n"
+        "Click the button below to share your update.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     7: (
-        "**📋 Week 7 Check-in**\n\n"
-        "Seven weeks in — you're doing amazing!\n"
-        "Click the button below to submit your weekly progress update.\n\n"
-        "*We're here to support you every step of the way.*"
+        "**📋 Week 7 Coach Check-in**\n\n"
+        "Seven weeks in — stay focused on your next milestone.\n"
+        "Click the button below to submit your check-in.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     8: (
-        "**📋 Week 8 Check-in**\n\n"
-        "Two months in — keep pushing toward your goals!\n"
-        "Click the button below to submit your weekly check-in.\n\n"
-        "*Your progress matters — let's track it together.*"
+        "**📋 Week 8 Coach Check-in**\n\n"
+        "Two months in — share where you're at this week.\n"
+        "Click the button below to submit your check-in.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     9: (
-        "**📋 Week 9 Check-in**\n\n"
-        "Nine weeks in — every check-in brings you closer.\n"
-        "Click the button below to submit your weekly progress update.\n\n"
-        "*Consistency is the key to results.*"
+        "**📋 Week 9 Coach Check-in**\n\n"
+        "Nine weeks in — every check-in adds up.\n"
+        "Click the button below to share your update.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     10: (
-        "**📋 Week 10 Check-in**\n\n"
-        "Ten weeks in — outstanding commitment!\n"
-        "Click the button below to submit your weekly check-in.\n\n"
-        "*Your CSM reviews every submission to better support you.*"
+        "**📋 Week 10 Coach Check-in**\n\n"
+        "Ten weeks in — outstanding commitment.\n"
+        "Click the button below to share your update.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     11: (
-        "**📋 Week 11 Check-in**\n\n"
-        "Almost at the finish line — week 11 check-in time!\n"
-        "Click the button below to submit your progress update.\n\n"
-        "*One more week after this — keep going!*"
+        "**📋 Week 11 Coach Check-in**\n\n"
+        "One week left in your 12-week program — keep pushing.\n"
+        "Click the button below to share your update.\n\n"
+        "*Your coaching team uses this to help you make progress.*"
     ),
     12: (
-        "**📋 Week 12 Check-in — Final!**\n\n"
-        "You've reached week 12 — congratulations on an incredible run!\n"
+        "**📋 Week 12 Coach Check-in — Final**\n\n"
+        "You've reached week 12 — congrats on an incredible run.\n"
         "Click the button below to submit your final check-in.\n\n"
-        "*After this you'll move to the regular weekly check-in schedule.*"
+        "*After this you'll roll off the weekly coach check-in sequence.*"
     ),
 }
 
 
-# --- Background task: send new-member check-in sequence (4 DMs, weekly) ---
+# --- Background task: send new-member coach check-in sequence (12 DMs, weekly) ---
 @tasks.loop(hours=6)
 async def check_pending_members():
     pending = load_pending()
@@ -1882,10 +2185,10 @@ async def weekly_reminder():
         return
     await _send_checkin_dms(
         "weekly",
-        "**\U0001f4cb Weekly Check-in Time!**\n\n"
-        "It's time for your weekly accountability check-in.\n"
-        "Click the button below to submit your progress update.\n\n"
-        "*This helps us keep your support aligned each week.*",
+        "**\U0001f4cb Weekly Coach Check-in**\n\n"
+        "Time for your weekly coach check-in.\n"
+        "Click the button below to share where you're at.\n\n"
+        "*Your coaching team uses this to help you make progress.*",
     )
 
 
@@ -1896,9 +2199,9 @@ async def midweek_reminder():
     await _send_checkin_dms(
         "midweek",
         "**\U0001f514 Midweek Reminder**\n\n"
-        "You haven't submitted your check-in yet this week.\n"
-        "Click below to log your progress \u2014 it only takes a minute.\n\n"
-        "*Your CSM uses this to support you better.*",
+        "You haven't submitted your coach check-in yet this week.\n"
+        "Click below to share your update \u2014 it only takes a minute.\n\n"
+        "*Your coaching team uses this to help you make progress.*",
     )
 
 
