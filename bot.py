@@ -1375,10 +1375,10 @@ class CheckInModal(discord.ui.Modal, title="Weekly Coach Check-in"):
         self.feeling = feeling
 
     roadmap_step = discord.ui.TextInput(
-        label="What step # on the roadmap are you at?",
-        placeholder="e.g. 7",
+        label="Where are you on the roadmap checklist?",
+        placeholder="e.g. 3 - Sourcing / Final Verification",
         style=discord.TextStyle.short,
-        max_length=10,
+        max_length=100,
     )
     weeks = discord.ui.TextInput(
         label="How many weeks have you been in this stage?",
@@ -2091,8 +2091,8 @@ async def run_conversational_checkin(
 
         roadmap_step = await _ask_text(
             client=client, user=user, channel=channel,
-            prompt="**2 / 8 — What step number on the roadmap checklist are you at?**\n*Just the number — e.g. `7`*",
-            max_length=10,
+            prompt="**2 / 8 — Where are you on the roadmap checklist?**\n*Step number and name — e.g. `3 - Sourcing / Final Verification`*",
+            max_length=100,
         )
         if roadmap_step is None:
             return
