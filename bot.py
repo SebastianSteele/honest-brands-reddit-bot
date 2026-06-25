@@ -9,6 +9,7 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 import aiohttp
+from aiohttp import web
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -21,6 +22,14 @@ CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
 CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
 CLICKUP_MEMBER_DB_LIST_ID = "901516122313"
 EXPORT_WEBHOOK_URL = os.getenv("EXPORT_WEBHOOK_URL", "")
+
+# --- Manual "send check-in now" HTTP endpoint -----------------------------
+# Lets the HonestBrands HQ dashboard fire a one-off 1:1 check-in nudge for a
+# specific member (CSM clicks "Send check-in now"). Disabled unless
+# CHECKIN_API_SECRET is set. Binds to $PORT (Railway web service) or
+# CHECKIN_API_PORT, default 8080.
+CHECKIN_API_SECRET = (os.getenv("CHECKIN_API_SECRET") or "").strip()
+CHECKIN_API_PORT = int(os.getenv("PORT") or os.getenv("CHECKIN_API_PORT") or "8080")
 # Optional: exact name of the weekly-hours custom field on the check-in list (see CANONICAL_WEEKLY_HOURS_FIELD_NAMES).
 CLICKUP_WEEKLY_HOURS_FIELD_NAME = (os.getenv("CLICKUP_WEEKLY_HOURS_FIELD_NAME") or "").strip()
 # Optional: force this field UUID on the check-in list (skips list-field discovery).
@@ -3042,6 +3051,123 @@ async def before_monthly_export():
     await client.wait_until_ready()
 
 
+# --- Manual "send check-in now" — single member -------------------------------
+def _find_guild_member(*, user_id: str | None = None, username: str | None = None):
+    """Locate a (guild, member) pair across every guild the bot is in.
+
+    Matches by Discord user id first (exact), then by lowercased username.
+    Returns (None, None) when nothing matches.
+    """
+    uname = (username or "").strip().lstrip("@").lower() or None
+    uid = (user_id or "").strip() or None
+    for guild in client.guilds:
+        if uid:
+            try:
+                m = guild.get_member(int(uid))
+            except (TypeError, ValueError):
+                m = None
+            if m is not None:
+                return guild, m
+        if uname:
+            for m in guild.members:
+                if (m.name or "").lower() == uname:
+                    return guild, m
+    return None, None
+
+
+async def send_checkin_to_member(member: discord.Member, guild: discord.Guild, kind: str = "weekly") -> dict:
+    """Send a single coach check-in nudge to one member, on demand.
+
+    Mirrors the scheduled job's routing: post in the member's 1-1 ticket
+    channel (with @mention + Start Check-in button) when one exists, else fall
+    back to a DM. This is a manual CSM override, so it intentionally bypasses
+    the weekly-eligibility filters (join window / advanced stage / already
+    checked in) — the only thing it still respects is DM-blocked on the DM
+    fallback path. Returns a small result dict for the API response.
+    """
+    if kind == "midweek":
+        channel_msg, dm_msg = _MIDWEEK_CHANNEL_MSG, _MIDWEEK_DM_MSG
+    else:
+        channel_msg, dm_msg = _WEEKLY_CHANNEL_MSG, _WEEKLY_DM_MSG
+
+    candidates = _ticket_channels_for_username(guild, (member.name or "").lower())
+    ticket_channel = _pick_ticket_channel_for_confirmation(candidates)
+    if ticket_channel is not None:
+        try:
+            await ticket_channel.send(channel_msg.format(mention=member.mention), view=CheckInButton())
+            print(f"[SEND-NOW] {kind} -> #{ticket_channel.name} for {member.display_name}")
+            return {"ok": True, "via": "channel", "channel": ticket_channel.name}
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"[SEND-NOW] channel post failed ({e}) — falling back to DM")
+
+    if is_dm_blocked(member.id):
+        return {"ok": False, "error": "dm_blocked"}
+    try:
+        await member.send(dm_msg, view=CheckInButton())
+        print(f"[SEND-NOW] {kind} -> DM for {member.display_name}")
+        return {"ok": True, "via": "dm"}
+    except discord.Forbidden:
+        mark_dm_blocked(member.id)
+        return {"ok": False, "error": "dm_blocked"}
+    except discord.HTTPException as e:
+        return {"ok": False, "error": f"discord_http_{e.status}"}
+
+
+async def _handle_send_checkin(request: web.Request) -> web.Response:
+    """POST /send-checkin — fire a manual 1:1 check-in nudge.
+
+    Auth: shared secret via `X-Api-Secret` header (or `?secret=`).
+    Body (JSON): { "username"?: str, "user_id"?: str, "kind"?: "weekly"|"midweek" }
+    One of username / user_id is required.
+    """
+    secret = request.headers.get("X-Api-Secret") or request.query.get("secret") or ""
+    if not CHECKIN_API_SECRET or secret != CHECKIN_API_SECRET:
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    username = str(body.get("username") or "").strip() or None
+    user_id = str(body.get("user_id") or "").strip() or None
+    kind = (str(body.get("kind") or "weekly").lower())
+    if kind not in ("weekly", "midweek"):
+        kind = "weekly"
+    if not username and not user_id:
+        return web.json_response({"ok": False, "error": "username_or_user_id_required"}, status=400)
+
+    guild, member = _find_guild_member(user_id=user_id, username=username)
+    if member is None:
+        return web.json_response({"ok": False, "error": "member_not_found"}, status=404)
+
+    result = await send_checkin_to_member(member, guild, kind=kind)
+    result["member"] = {
+        "id": str(member.id),
+        "username": member.name,
+        "display_name": member.display_name,
+    }
+    return web.json_response(result, status=200 if result.get("ok") else 502)
+
+
+async def _handle_api_health(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "bot": str(client.user) if client.user else None})
+
+
+_api_started = False
+
+
+async def start_api_server() -> None:
+    """Run the aiohttp endpoint alongside the Discord client."""
+    app = web.Application()
+    app.router.add_get("/healthz", _handle_api_health)
+    app.router.add_post("/send-checkin", _handle_send_checkin)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", CHECKIN_API_PORT)
+    await site.start()
+    print(f"[API] send-checkin endpoint listening on :{CHECKIN_API_PORT}")
+
+
 # --- Bot ready ---
 _synced = False
 
@@ -3057,7 +3183,7 @@ async def _prefetch_weekly_hours_field():
 
 @client.event
 async def on_ready():
-    global _synced
+    global _synced, _api_started
 
     # Register persistent views (must happen every reconnect)
     client.add_view(CheckInButton())
@@ -3095,6 +3221,10 @@ async def on_ready():
         if not monthly_export.is_running():
             monthly_export.start()
         asyncio.create_task(_prefetch_weekly_hours_field())
+        # Start the manual "send check-in now" HTTP endpoint
+        if CHECKIN_API_SECRET and not _api_started:
+            _api_started = True
+            asyncio.create_task(start_api_server())
 
         # HonestAI FAQ scraper — daily scrape of #ask-honestai that
         # ships to the Apps Script Web App. Runs here (not in Apps
